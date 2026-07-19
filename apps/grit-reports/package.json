@@ -1,0 +1,6 @@
+{
+  "name": "grit-reports",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Grit Reports — cross-app report constructor for Grit BizSuite."
+}

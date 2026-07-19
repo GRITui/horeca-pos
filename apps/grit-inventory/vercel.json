@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "crons": [
+    { "path": "/api/cron/restock-alert", "schedule": "0 8 * * *" },
+    { "path": "/api/cron/forecast-recompute", "schedule": "0 2 * * *" },
+    { "path": "/api/cron/dead-stock-scan", "schedule": "30 2 * * *" },
+    { "path": "/api/cron/events-drain", "schedule": "45 * * * *" }
+  ]
+}

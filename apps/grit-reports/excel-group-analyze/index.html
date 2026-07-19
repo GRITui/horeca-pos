@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Excel Group &amp; Analyze</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+      background: #1e1e1e;
+      color: #eee;
+      margin: 0;
+      padding: 28px 24px;
+      display: flex;
+      justify-content: center;
+    }
+    main { width: 100%; max-width: 1440px; }
+    h1 { font-size: 20px; margin: 0 0 4px 0; }
+    p.subtitle { color: #999; margin-top: 0; margin-bottom: 20px; font-size: 13px; }
+    h2 { font-size: 14px; margin: 0 0 10px 0; color: #ddd; }
+    h2 small { color: #999; font-weight: normal; }
+
+    #topBar {
+      display: flex; align-items: stretch; gap: 14px; margin-bottom: 14px; flex-wrap: wrap;
+    }
+    #dropzone {
+      flex: 1 1 380px;
+      border: 2px dashed #555;
+      border-radius: 10px;
+      padding: 18px 16px;
+      text-align: center;
+      color: #aaa;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    #dropzone.dragover { border-color: #2d6cdf; background: #26304a; }
+    #dropzone strong { color: #ddd; }
+    #fileInput { display: none; }
+    #sheetBox {
+      flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+      border: 1px solid #3a3a3a; border-radius: 10px; padding: 12px 16px; background: #232323;
+    }
+
+    label { font-size: 13px; color: #bbb; }
+    select, input[type="number"], input[type="text"] {
+      background: #2a2a2a; color: #eee; border: 1px solid #555;
+      border-radius: 6px; padding: 7px 10px; font-size: 13px;
+    }
+    input[type="text"] { width: 140px; }
+    button {
+      background: #2d6cdf; color: white; border: none;
+      padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer;
+    }
+    button:disabled { background: #444; cursor: not-allowed; }
+    button.secondary { background: #3a7d44; }
+    button.small { padding: 6px 10px; font-size: 12px; background: #444; }
+    button.small:hover { background: #555; }
+
+    #fileName { font-size: 13px; color: #ccc; word-break: break-all; }
+
+    /* Desktop-first: config sections in a 2-column grid, collapsing on narrow screens */
+    #configSection { display: none; }
+    #configSection.visible {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      align-items: start;
+    }
+    .span2 { grid-column: 1 / -1; }
+    @media (max-width: 900px) {
+      #configSection.visible { grid-template-columns: 1fr; }
+      .span2 { grid-column: auto; }
+    }
+
+    .box {
+      border: 1px solid #3a3a3a; border-radius: 10px;
+      padding: 14px 16px; background: #232323;
+    }
+
+    /* Progressive disclosure: advanced sections (4, 8, 9) collapse behind a <details> summary */
+    details.box > summary {
+      cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px;
+      margin-bottom: 10px;
+    }
+    details.box > summary::-webkit-details-marker { display: none; }
+    details.box > summary::marker { content: ""; }
+    details.box > summary h2 { margin: 0; flex: 1; }
+    details.box > summary::before {
+      content: "\25B8"; color: #999; font-size: 12px; transition: transform 0.12s; flex: 0 0 auto;
+    }
+    details.box[open] > summary::before { transform: rotate(90deg); }
+
+    #quickStartBox { margin-bottom: 14px; }
+    .qsGrid { display: flex; gap: 12px; flex-wrap: wrap; }
+    .qsCard {
+      flex: 1 1 220px; border: 1px solid #3a3a3a; border-radius: 8px;
+      padding: 12px 14px; background: #1c1c1c;
+    }
+    .qsCard h3 { font-size: 13px; margin: 0 0 6px 0; color: #ddd; }
+    .qsCard p { font-size: 12px; color: #999; margin: 0 0 10px 0; line-height: 1.4; }
+    #presetBar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    #presetBar .spacer { flex: 1; }
+
+    .colList { display: flex; flex-wrap: wrap; gap: 6px 16px; max-height: 180px; overflow-y: auto; }
+    .colList label {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 13px; color: #ddd; cursor: pointer;
+      padding: 3px 0;
+    }
+    .colList label .gran {
+      padding: 2px 6px; font-size: 11px; cursor: default;
+    }
+    .configRow {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .configRow:last-child { margin-bottom: 0; }
+    .muted { color: #999; font-size: 12px; }
+
+    input.formula {
+      flex: 1; min-width: 240px;
+      font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+      font-size: 12.5px;
+    }
+    #chipBar { margin-bottom: 10px; }
+    #chipRow { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .chip {
+      display: inline-block; padding: 4px 10px; border-radius: 999px;
+      background: #26304a; border: 1px solid #2d6cdf; color: #cfe0ff;
+      font-size: 12px; cursor: grab; user-select: none;
+      font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    }
+    .chip:active { cursor: grabbing; }
+    .chip.calc { background: #253a2a; border-color: #3a7d44; color: #cdeed4; }
+
+    .labelBlock {
+      border: 1px solid #333; border-radius: 8px;
+      padding: 10px 12px; margin-bottom: 10px;
+    }
+    .labelBlock .blockHead { margin-bottom: 8px; }
+    .arrow { color: #999; }
+
+    #runRow { display: flex; gap: 12px; align-items: center; }
+    #helpPanel h3 { font-size: 13px; color: #ddd; margin: 12px 0 4px; }
+    #helpPanel p { font-size: 12.5px; color: #aaa; line-height: 1.55; margin: 4px 0; }
+    #helpPanel code {
+      background: #2a2a2a; border: 1px solid #444; border-radius: 4px;
+      padding: 1px 5px; font-size: 11.5px; color: #cfe0ff;
+      font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    }
+    .helpCols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; }
+    @media (max-width: 900px) { .helpCols { grid-template-columns: 1fr; } }
+    #status { margin: 14px 0; font-size: 14px; white-space: pre-wrap; }
+    .success { color: #4caf50; }
+    .error { color: #f44336; }
+    .warning { color: #d98c2b; }
+
+    .aggSel { margin-left: 4px; padding: 3px 6px; font-size: 12px; }
+    #kpiBar {
+      display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 14px 0;
+    }
+    #kpiBar:empty { display: none; }
+    .kpiTile {
+      flex: 1 1 160px;
+      border: 1px solid #3a3a3a; border-radius: 10px;
+      padding: 12px 16px; background: #232323;
+    }
+    .kpiValue { font-size: 20px; font-weight: 600; color: #2d6cdf; }
+    .kpiLabel { font-size: 12px; color: #999; margin-top: 4px; }
+
+    #chartArea {
+      margin: 14px 0 20px 0;
+      max-width: 760px;
+      max-height: 420px;
+    }
+    #chartCanvasWrap { position: relative; width: 100%; height: 380px; }
+    #chartArea canvas { max-width: 100%; }
+    td.colorScaleCell { color: #eee; }
+
+    #previewWrap { overflow-x: auto; max-height: 60vh; overflow-y: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 8px; }
+    th, td { border: 1px solid #444; padding: 6px 10px; text-align: left; }
+    th { background: #2a2a2a; position: sticky; top: 0; }
+    tr:nth-child(even) td { background: #252525; }
+    td.num { text-align: right; }
+    tr.totalRow td { font-weight: 600; border-top: 2px solid #666; background: #2a2a2a; }
+    #previewNote { color: #999; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Excel Group &amp; Analyze</h1>
+    <p class="subtitle">Upload a spreadsheet, choose how to group it, what to sum, what to calculate, and which rows you want in the result. &mdash; <a href="grit-dashboard.html" style="color:#6ea8fe">Grit BizSuite dashboard</a></p>
+
+    <div id="topBar">
+      <div id="dropzone">
+        <strong>Click to choose a file</strong> or drag &amp; drop it here<br />
+        <span id="fileName">No file selected</span>
+      </div>
+      <div id="sheetBox">
+        <label for="sheetSelect">Sheet:</label>
+        <select id="sheetSelect" disabled></select>
+      </div>
+      <button class="small" id="helpBtn" type="button">Help</button>
+    </div>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+
+    <div class="box" id="quickStartBox">
+      <h2>Quick start <small>&mdash; try a template with built-in sample data, no file needed</small></h2>
+      <div class="qsGrid">
+        <div class="qsCard">
+          <h3>Sales vs Target</h3>
+          <p>Group sales by region, compute % of target achieved, and chart the result.</p>
+          <button class="small" type="button" data-template="salesVsTarget">Try with sample data</button>
+        </div>
+        <div class="qsCard">
+          <h3>Store ranking</h3>
+          <p>Rank stores by sales, keep the top performers, and chart them.</p>
+          <button class="small" type="button" data-template="storeRanking">Try with sample data</button>
+        </div>
+        <div class="qsCard">
+          <h3>OOS / delist candidates</h3>
+          <p>Find SKUs with a high out-of-stock rate using a conditional metric, a calculated column, and a filter.</p>
+          <button class="small" type="button" data-template="oosDelist">Try with sample data</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="box" id="helpPanel" hidden>
+      <h2>How everything works</h2>
+      <div class="helpCols">
+        <div>
+          <h3>Formulas (Calculated columns)</h3>
+          <p>Reference columns in square brackets and combine with <code>+ - * / ( )</code> and numbers:</p>
+          <p><code>([Qty Ordered] - [Qty Shipped]) / [Qty Ordered] * 100</code></p>
+          <p>A formula can use any column checked in <em>Data for calculation</em> and any calculated column defined <em>above</em> it. Division by zero gives 0. Drag a column chip into the formula (or click it) instead of typing.</p>
+          <h3>Aggregation per column</h3>
+          <p>The small dropdown next to each data column picks how rows combine per group: <code>sum</code>, <code>count</code>, <code>avg</code>, <code>min</code>, <code>max</code>. Blank cells are excluded from avg/min/max.</p>
+          <h3>Conditional aggregation (SUMIF / COUNTIF)</h3>
+          <p>Section 4 builds one new column per block: choose a type (sum, count, count distinct, average, min, max), a value column (required for every type except Count &mdash; the dropdown starts blank so you must pick one), and one or more &ldquo;and&rdquo; conditions on any raw column &mdash; a row only counts toward the block's total when every condition passes, like Excel's SUMIFS/COUNTIFS. At least one condition must have a value filled in (or use &ldquo;is blank&rdquo;/&ldquo;is not blank&rdquo;, which need no value); a block with no active condition would just duplicate an unconditional metric, so Run Analysis rejects it. The result column works anywhere a data column does: calculated-column formulas, category rules, filters, sorting, cross-tab, and charts.</p>
+          <h3>Date buckets</h3>
+          <p>Check a date column in <em>Group rows by</em> and pick a granularity: day &rarr; <code>2026-07-14</code>, week &rarr; <code>2026-W28</code> (ISO week), month &rarr; <code>2026-07</code>. Works with real Excel dates and date text.</p>
+        </div>
+        <div>
+          <h3>Category columns</h3>
+          <p>Rules are checked top to bottom; the <strong>first match wins</strong>, otherwise the fallback label applies. Categories can be used in filters and sorting.</p>
+          <h3>Lookup join</h3>
+          <p>Left join: every main row keeps its data and gains the picked lookup columns from the <em>first</em> matching lookup row; no match leaves them blank. Join happens <em>before</em> grouping.</p>
+          <h3>Cross-tab &amp; charts</h3>
+          <p>Cross-tab spreads one value column across a column's distinct values (max 40). Charts and the color scale read the final result table; the color scale is preview-only and not written to the .xlsx.</p>
+          <p>Chart extras (all preview-only): bars can be vertical or horizontal; <em>Axis min/max</em> pins the value axis range (blank = auto, ignored if min &ge; max); <em>Unit</em> shows ticks and tooltips as thousands (K), millions (M) or with a % suffix. <em>Series by</em> splits bars/lines into one colored series per value of a column (top 12 by total, the rest fold into &ldquo;Other&rdquo;), and <em>Stacked</em> stacks those series instead of placing them side by side.</p>
+          <h3>Display formats</h3>
+          <p>Per column: <code>number</code> (thousands separators), <code>percent</code> (a value of 87.5 shows as 87.5% and becomes a true Excel percent in the download), or <code>text</code>, each with a decimals choice.</p>
+          <h3>Presets</h3>
+          <p>Presets live in this browser. Use <em>Export file</em> / <em>Import file</em> to move them to another computer. Loading a preset onto a file that lacks some of its columns skips just those parts and warns you.</p>
+        </div>
+      </div>
+    </div>
+
+    <div id="configSection">
+      <div class="box span2" id="presetBar">
+        <h2 style="margin:0">Presets</h2>
+        <select id="presetSelect"></select>
+        <button class="small" id="deletePresetBtn" type="button">Delete</button>
+        <span class="spacer"></span>
+        <input type="text" id="presetNameInput" placeholder="New name (empty = update selected)" />
+        <button class="small" id="savePresetBtn" type="button">Save current setup</button>
+        <button class="small" id="exportPresetsBtn" type="button" title="Download all saved presets as a file to use on another computer">Export file</button>
+        <button class="small" id="importPresetsBtn" type="button" title="Load presets from an exported file">Import file</button>
+        <input type="file" id="importPresetsInput" accept=".json" style="display:none" />
+      </div>
+
+      <div class="box span2" id="joinBox">
+        <h2>1. Lookup file (optional) <small>&mdash; join a second spreadsheet by a shared key before grouping</small></h2>
+        <div class="configRow">
+          <label><input type="checkbox" id="joinEnabled" /> Enable lookup join</label>
+        </div>
+        <div class="configRow">
+          <button class="small" id="lookupFileBtn" type="button">Choose lookup file</button>
+          <span id="lookupFileName" class="muted">No file selected</span>
+          <input type="file" id="lookupFileInput" accept=".xlsx,.xls,.csv" style="display:none" />
+          <label for="lookupSheetSelect" style="margin-left:10px">Sheet:</label>
+          <select id="lookupSheetSelect" disabled></select>
+        </div>
+        <div class="configRow">
+          <label for="joinLeftKey">Match main column</label>
+          <select id="joinLeftKey"></select>
+          <span class="arrow">&rarr;</span>
+          <label for="joinRightKey">to lookup column</label>
+          <select id="joinRightKey"></select>
+        </div>
+        <div class="configRow">
+          <span class="muted">Columns to bring in from the lookup file:</span>
+        </div>
+        <div class="colList" id="joinColsBox"><span class="muted">Load a lookup file first.</span></div>
+      </div>
+
+      <div class="box">
+        <h2>2. Group rows by <small>&mdash; the key columns to look up (e.g. SKU, Store Code)</small></h2>
+        <div class="colList" id="groupByBox"></div>
+      </div>
+
+      <div class="box">
+        <h2>3. Data for calculation <small>&mdash; numeric columns totaled per group, used by the formulas below</small></h2>
+        <div class="colList" id="metricsBox"></div>
+      </div>
+
+      <details class="box span2" id="condMetricsBox">
+        <summary><h2>4. Conditional aggregation (SUMIF / COUNTIF) <small>&mdash; sum/count/etc. a raw column only for rows matching one or more conditions, e.g. Central Sales = SUM(Sales) where Region = Central</small></h2></summary>
+        <div id="condMetricList"></div>
+        <button class="small" id="addCondMetricBtn" type="button">+ Add conditional metric</button>
+      </details>
+
+      <div class="box">
+        <h2>5. Calculated columns <small>&mdash; write formulas over the data columns, e.g. ([Qty Ordered] &minus; [Qty Shipped]) / [Qty Ordered] * 100</small></h2>
+        <div id="chipBar" hidden>
+          <span class="muted">Drag a column into a formula (or click to insert):</span>
+          <div id="chipRow"></div>
+        </div>
+        <div id="derivedList"></div>
+        <button class="small" id="addDerivedBtn" type="button">+ Add calculated column</button>
+      </div>
+
+      <div class="box">
+        <h2>6. Category columns <small>&mdash; label each group from its numbers; first matching rule wins</small></h2>
+        <div id="labelList"></div>
+        <button class="small" id="addLabelBtn" type="button">+ Add category column</button>
+      </div>
+
+      <div class="box span2">
+        <h2>7. Filter &amp; sort the result <small>&mdash; keep only groups matching every condition</small></h2>
+        <div id="filterList"></div>
+        <button class="small" id="addFilterBtn" type="button">+ Add condition</button>
+        <div class="configRow" style="margin-top:12px">
+          <label for="sortColSelect">Sort result by:</label>
+          <select id="sortColSelect"></select>
+          <select id="sortDirSelect">
+            <option value="desc">High to low</option>
+            <option value="asc">Low to high</option>
+          </select>
+        </div>
+        <div class="configRow">
+          <label for="topNInput">Keep top N rows:</label>
+          <input type="number" id="topNInput" min="0" step="1" placeholder="all" style="width:70px" />
+          <label for="kpiColSelect" style="margin-left:14px">KPI metric:</label>
+          <select id="kpiColSelect"></select>
+          <label style="margin-left:14px"><input type="checkbox" id="totalRowEnabled" /> Add a Total row</label>
+          <label><input type="checkbox" id="avgRowEnabled" /> Add an Average row</label>
+        </div>
+      </div>
+
+      <details class="box span2" id="pivotBox">
+        <summary><h2>8. Cross-tab (pivot) <small>&mdash; turn one result column's values into separate columns (cap 40 distinct values)</small></h2></summary>
+        <div class="configRow">
+          <label><input type="checkbox" id="pivotEnabled" /> Enable cross-tab</label>
+        </div>
+        <div class="configRow">
+          <label for="pivotColDim">Turn into columns:</label>
+          <select id="pivotColDim"></select>
+          <label for="pivotValueCol" style="margin-left:14px">Values:</label>
+          <select id="pivotValueCol"></select>
+        </div>
+      </details>
+
+      <details class="box span2" id="vizBox">
+        <summary><h2>9. Charts &amp; formatting <small>&mdash; visualize the result and color-scale a numeric column in the preview (preview only, not saved to the .xlsx)</small></h2></summary>
+        <div class="configRow">
+          <label for="vizChartType">Chart:</label>
+          <select id="vizChartType">
+            <option value="none">None</option>
+            <option value="bar">Bar &mdash; vertical (column)</option>
+            <option value="barh">Bar &mdash; horizontal</option>
+            <option value="pie">Pie (share of total)</option>
+            <option value="line">Line (over X)</option>
+          </select>
+          <label for="vizXCol" style="margin-left:14px">X / category:</label>
+          <select id="vizXCol"></select>
+          <label for="vizValueCol" style="margin-left:14px">Value:</label>
+          <select id="vizValueCol"></select>
+          <label for="vizTopN" style="margin-left:14px">Top N (bar):</label>
+          <input type="number" id="vizTopN" min="1" step="1" value="10" style="width:60px" />
+        </div>
+        <div class="configRow">
+          <label for="vizSeriesCol">Series by:</label>
+          <select id="vizSeriesCol"></select>
+          <label><input type="checkbox" id="vizStacked" /> Stacked</label>
+          <label for="vizAxisMin" style="margin-left:14px">Axis min:</label>
+          <input type="number" id="vizAxisMin" placeholder="auto" style="width:80px" />
+          <label for="vizAxisMax">Axis max:</label>
+          <input type="number" id="vizAxisMax" placeholder="auto" style="width:80px" />
+          <label for="vizAxisUnit" style="margin-left:14px">Unit:</label>
+          <select id="vizAxisUnit">
+            <option value="none">None</option>
+            <option value="K">K (thousands)</option>
+            <option value="M">M (millions)</option>
+            <option value="%">%</option>
+          </select>
+        </div>
+        <div class="configRow">
+          <span class="muted">Exclude from the chart:</span>
+          <label><input type="checkbox" id="vizExcludeBlank" /> blank values</label>
+          <label><input type="checkbox" id="vizExcludeTotals" /> total / summary rows (total, sum, &#3619;&#3623;&#3617;)</label>
+        </div>
+        <div class="configRow">
+          <label><input type="checkbox" id="colorScaleEnabled" /> Color-scale a column in the preview table</label>
+          <select id="colorScaleCol"></select>
+        </div>
+        <div class="configRow" style="margin-top:10px">
+          <span class="muted">Display formats &mdash; how result columns are shown in the preview and written to the .xlsx:</span>
+        </div>
+        <div id="formatList"></div>
+        <button class="small" id="addFormatBtn" type="button">+ Add column format</button>
+      </details>
+
+      <div class="span2" id="runRow">
+        <button id="runBtn">Run Analysis</button>
+        <button id="downloadBtn" class="secondary" hidden>Download Excel (.xlsx)</button>
+      </div>
+    </div>
+
+    <div id="status"></div>
+
+    <div id="kpiBar" class="span2"></div>
+
+    <div id="previewWrap"></div>
+    <div id="previewNote"></div>
+
+    <div id="chartArea" hidden>
+      <div id="chartCanvasWrap"><canvas id="vizCanvas"></canvas></div>
+      <span id="chartNote" class="muted"></span>
+      <button class="small" id="downloadChartBtn" type="button" style="margin-top:8px">Download chart (.png)</button>
+    </div>
+  </main>
+
+  <script src="xlsx.full.min.js"></script>
+  <script src="chart.umd.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

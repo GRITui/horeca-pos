@@ -1,0 +1,355 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>Invoice — Sidekick</title>
+<meta name="description" content="View and pay an invoice.">
+<link rel="icon" href="icons/icon.svg">
+<meta name="theme-color" content="#F7F6F2">
+<script>(function(){var K='sidekick_ui_theme',t=localStorage.getItem(K);if(t==='dark')document.documentElement.dataset.theme='dark';else if(t!=='auto')document.documentElement.dataset.theme='light';})();</script>
+<link rel="stylesheet" href="styles.css?v=0.9.37">
+<style>
+  /* Public invoice page has no bottom nav / app shell — same override as
+     app/book.html so this reads as its own page on desktop, not a
+     phone-width column floating in blank space. */
+  body{ max-width:560px; padding-bottom:40px; }
+  .ipub-hero{ padding:26px 20px 6px; text-align:center; }
+  .ipub-hero .ipub-owner{ font-size:13px; color:var(--text3); margin:0 0 4px; }
+  .ipub-hero h1{ font-size:20px; font-weight:800; margin:0; display:flex; align-items:center; justify-content:center; gap:8px; flex-wrap:wrap; }
+  .ipub-paidbanner{ margin:14px 20px 0; padding:12px 16px; border-radius:var(--radius-sm); background:color-mix(in srgb,var(--paid) 16%,transparent); color:var(--paid); font-weight:800; font-size:14px; text-align:center; }
+  .ipub-section{ padding:14px 20px 0; }
+  .ipub-section-title{ font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; color:var(--text3); margin:0 0 8px; }
+  .ipub-meta{ font-size:12px; color:var(--text3); margin-top:4px; }
+  .ipub-client{ font-size:14px; font-weight:700; color:var(--text); }
+  table.ipub-lines{ width:100%; border-collapse:collapse; font-size:14px; }
+  table.ipub-lines td{ padding:6px 0; }
+  .ipub-totals{ margin:6px 20px 10px; background:var(--brand-tint); border-radius:var(--radius-sm); padding:14px 16px; }
+  .ipub-trow{ display:flex; justify-content:space-between; margin:3px 0; font-size:13px; color:var(--text2); }
+  .ipub-trow.strong{ font-weight:800; color:var(--brand); font-size:15px; }
+  .ipub-notes{ padding:0 20px 8px; font-size:12px; color:var(--text3); white-space:pre-wrap; }
+  .ipub-chan{ text-align:center; margin-bottom:10px; }
+  .ipub-chan:last-child{ margin-bottom:0; }
+  .ipub-qrbox{ display:inline-block; background:#fff; padding:14px; border-radius:14px; border:1px solid var(--border); }
+  .ipub-chan-label{ font-size:12px; color:var(--text3); margin-top:6px; }
+  .ipub-amt{ font-family:'Spline Sans Mono',monospace; font-size:16px; font-weight:800; color:var(--text); margin-top:2px; }
+  .ipub-paybtn{ display:block; text-align:center; background:var(--pine,#22554B); color:#fff; font-weight:800; border-radius:12px; padding:12px; text-decoration:none; }
+  .ipub-chan-card{ text-align:left; background:var(--card); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px 14px; }
+  .ipub-chan-title{ font-size:11px; font-weight:800; color:var(--text3); text-transform:uppercase; letter-spacing:.3px; }
+  .ipub-chan-detail{ font-size:14px; color:var(--text); white-space:pre-wrap; margin-top:4px; }
+  .ipub-note{ background:var(--marigold-tint); border-radius:var(--radius-sm); padding:14px; font-size:13px; color:var(--marigold-ink); }
+  .ipub-attach-btn{ width:100%; padding:13px; border:1.5px dashed var(--border-mid); background:none; color:var(--text2); border-radius:var(--radius-sm); font-weight:700; font-family:inherit; font-size:13px; cursor:pointer; }
+  .ipub-attach-btn:disabled{ opacity:.6; }
+  .ipub-hint{ font-size:12px; color:var(--text3); margin:6px 0; }
+  .ipub-success{ background:color-mix(in srgb,var(--paid) 14%,transparent); color:var(--paid); border-radius:var(--radius-sm); padding:12px 14px; font-size:13px; font-weight:700; margin-bottom:8px; }
+  .ipub-error-toast{ background:color-mix(in srgb,var(--overdue) 14%,transparent); color:var(--overdue); border-radius:var(--radius-sm); padding:12px 14px; font-size:13px; font-weight:700; margin-bottom:8px; }
+  .book-empty, .book-error{ padding:40px 20px; text-align:center; color:var(--text3); font-size:13.5px; }
+</style>
+
+<body data-page="invoice">
+
+<div id="ipub-root">
+  <div class="book-empty">กำลังโหลด… / Loading…</div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<script>
+  // invoices.js expects a handful of app.js/dataClient.js globals to exist
+  // by the time any of ITS DOM-facing functions run — none of which this
+  // page ever calls (it only reads window.SidekickPromptPay, the pure
+  // EMVCo-payload/QR-matrix primitives it exposes at the bottom of its own
+  // IIFE, built from literal object/const initializers with no dependency
+  // on any of these). Defined as harmless no-ops purely to make the load
+  // below provably safe standalone — invoices.js's own top level is
+  // function/const declarations only, so nothing actually calls these, but
+  // this removes any doubt.
+  window.htmlEsc = window.htmlEsc || function (s) { return s; };
+  window.attrEsc = window.attrEsc || function (s) { return s; };
+</script>
+<script src="invoices.js?v=0.9.37"></script>
+<script>
+const API_BASE = window.__SIDEKICK_API_BASE || 'https://sidekickz.vercel.app';
+const params = new URLSearchParams(location.search);
+const invCuid = params.get('i');
+
+let invoiceData = null;
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+function toast(msg) {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 3200);
+}
+function n(v) { const x = parseFloat(v); return isFinite(x) ? x : 0; }
+function money2(v) {
+  return '฿' + n(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtQty(v) {
+  const x = n(v);
+  return x.toLocaleString('en-US', { minimumFractionDigits: x % 1 ? 2 : 0, maximumFractionDigits: 2 });
+}
+function fmtDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso.length <= 10 ? iso + 'T12:00:00' : iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function statusBlockHtml(status) {
+  if (status === 'paid') return `<div class="ipub-paidbanner">✓ ชำระแล้ว / Paid</div>`;
+  const map = {
+    overdue: ['chip-overdue', 'เกินกำหนด / Overdue'],
+    sent: ['chip-due', 'ส่งแล้ว / Sent'],
+    draft: ['', 'ร่าง / Draft'],
+  };
+  const [cls, label] = map[status] || map.draft;
+  return cls
+    ? `<span class="chip ${cls}">${esc(label)}</span>`
+    : `<span class="chip" style="background:var(--border);color:var(--text3)">${esc(label)}</span>`;
+}
+
+// Only http(s) URLs ever render as a live link — same rule as
+// invoices.js's safeHttpUrl(), duplicated here since this page has no
+// import mechanism to share it (deliberately self-contained, see header).
+function safeHttpUrl(raw) {
+  try {
+    const u = new URL(String(raw || '').trim());
+    return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : null;
+  } catch (e) { return null; }
+}
+function channelLabel(type) {
+  const map = {
+    promptpay: 'พร้อมเพย์ / PromptPay',
+    paylink: 'ลิงก์ชำระเงิน / Payment link',
+    bank: 'บัญชีธนาคาร / Bank account',
+    cash: 'เงินสด / Cash',
+    other: 'ช่องทางอื่น / Other',
+  };
+  return map[type] || type;
+}
+
+async function load() {
+  const root = document.getElementById('ipub-root');
+  if (!invCuid) {
+    root.innerHTML = `<div class="book-error">ไม่พบใบแจ้งหนี้นี้ — ลิงก์อาจไม่ถูกต้อง / Invoice not found — this link looks invalid.</div>`;
+    return;
+  }
+  let res, data;
+  try {
+    res = await fetch(API_BASE + '/api/invoice-public?i=' + encodeURIComponent(invCuid));
+    data = await res.json();
+  } catch (err) {
+    root.innerHTML = `<div class="book-error">เชื่อมต่อไม่ได้ — ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่ / Could not connect — check your connection and reload.</div>`;
+    return;
+  }
+  if (!res.ok) {
+    root.innerHTML = `<div class="book-error">ไม่พบใบแจ้งหนี้นี้ หรือลิงก์หมดอายุ / Invoice not found — the link may be invalid or expired.</div>`;
+    return;
+  }
+  invoiceData = data;
+  document.title = (data.number || 'Invoice') + ' — ' + (data.ownerName || 'Sidekick');
+  render();
+}
+
+function render() {
+  const root = document.getElementById('ipub-root');
+  const d = invoiceData;
+  const lineItems = Array.isArray(d.lineItems) ? d.lineItems : [];
+  const linesHtml = lineItems.map(li => `
+    <tr>
+      <td style="color:var(--text2)">${esc(li.description || '—')}</td>
+      <td class="tnum" style="padding:6px 8px;text-align:right;color:var(--text3)">${esc(fmtQty(li.qty))} × ${esc(money2(li.unitPrice))}</td>
+      <td class="tnum" style="text-align:right;font-weight:700">${esc(money2(n(li.qty) * n(li.unitPrice)))}</td>
+    </tr>`).join('');
+
+  root.innerHTML = `
+    <div class="ipub-hero">
+      <div class="ipub-owner">ใบแจ้งหนี้จาก / Invoice from ${esc(d.ownerName || '—')}</div>
+      <h1>${esc(d.number || 'Invoice')} ${statusBlockHtml(d.status)}</h1>
+    </div>
+
+    <div class="ipub-section">
+      <div class="ipub-client">${esc(d.clientName || '—')}</div>
+      <div class="ipub-meta">
+        ออกวันที่ / Issued ${esc(fmtDate(d.issueDate))}${d.dueDate ? ' · ครบกำหนด / Due ' + esc(fmtDate(d.dueDate)) : ''}
+      </div>
+    </div>
+
+    <div class="ipub-section">
+      <table class="ipub-lines">${linesHtml}</table>
+    </div>
+
+    <div class="ipub-totals">
+      <div class="ipub-trow"><span>ยอดรวม / Subtotal</span><span class="tnum">${esc(money2(d.subtotal))}</span></div>
+      <div class="ipub-trow"><span>ภาษีมูลค่าเพิ่ม / VAT (${esc(fmtQty(d.vatPct))}%)</span><span class="tnum">+ ${esc(money2(d.vat))}</span></div>
+      <div class="ipub-trow"><span>หัก ณ ที่จ่าย / WHT (${esc(fmtQty(d.whtPct))}%)</span><span class="tnum">- ${esc(money2(d.wht))}</span></div>
+      <div style="border-top:1px solid var(--border-mid);margin:6px 0"></div>
+      <div class="ipub-trow strong"><span>ยอดที่ต้องชำระ / Total due</span><span class="tnum">${esc(money2(d.clientPays))}</span></div>
+      ${n(d.depositPct) > 0 ? `<div class="ipub-trow"><span>มัดจำ / Deposit (${esc(fmtQty(d.depositPct))}%)</span><span class="tnum">${esc(money2(n(d.clientPays) * n(d.depositPct) / 100))}</span></div>` : ''}
+    </div>
+
+    ${d.notes ? `<div class="ipub-notes">${esc(d.notes)}</div>` : ''}
+
+    <div class="ipub-section">
+      <div class="ipub-section-title">ช่องทางการชำระเงิน / Payment channels</div>
+      <div id="ipub-channels"></div>
+    </div>
+
+    <div class="ipub-section">
+      <div class="ipub-section-title">ชำระแล้ว? แนบสลิปได้เลย / Paid? Attach your slip</div>
+      <div id="ipub-slip-status"></div>
+      <input type="file" accept="image/*" id="ipub-slip-file" style="display:none">
+      <button type="button" id="ipub-slip-attach" class="ipub-attach-btn">แนบสลิป / Attach slip</button>
+    </div>
+  `;
+
+  renderChannels(Array.isArray(d.paymentChannels) ? d.paymentChannels : [], n(d.clientPays));
+  renderSlipStatus(false);
+
+  document.getElementById('ipub-slip-attach').addEventListener('click', () => document.getElementById('ipub-slip-file').click());
+  document.getElementById('ipub-slip-file').addEventListener('change', onSlipFileChosen);
+}
+
+function renderChannels(chans, amount) {
+  const wrap = document.getElementById('ipub-channels');
+  if (!chans.length) {
+    wrap.innerHTML = `<div class="ipub-note">ยังไม่มีช่องทางชำระเงิน — ติดต่อผู้ออกใบแจ้งหนี้โดยตรง / No payment channel added yet — contact the sender directly.</div>`;
+    return;
+  }
+  const PP = window.SidekickPromptPay;
+  wrap.innerHTML = chans.map((c, i) => {
+    if (c.type === 'promptpay') {
+      const target = PP && PP.normalizePromptPay(c.detail);
+      if (!target) return '';
+      return `<div class="ipub-chan">
+          <div class="ipub-qrbox"><canvas id="ipub-qr-${i}" style="display:block;image-rendering:pixelated"></canvas></div>
+          <div class="ipub-chan-label">สแกนพร้อมเพย์ / Scan PromptPay · ${esc(c.label || 'PromptPay')}</div>
+          <div class="ipub-amt">${esc(money2(amount))}</div>
+        </div>`;
+    }
+    if (c.type === 'paylink') {
+      const href = safeHttpUrl(c.detail);
+      if (href) {
+        return `<div class="ipub-chan">
+            <div class="ipub-chan-title">${esc(c.label || channelLabel('paylink'))}</div>
+            <a class="ipub-paybtn" href="${esc(href)}" target="_blank" rel="noopener noreferrer">ชำระเงิน / Pay now · ${esc(money2(amount))}</a>
+          </div>`;
+      }
+      // Invalid/unsafe URL → fall through to the plain-text card below.
+    }
+    return `<div class="ipub-chan ipub-chan-card">
+        <div class="ipub-chan-title">${esc(c.label || channelLabel(c.type))}</div>
+        ${c.detail ? `<div class="ipub-chan-detail">${esc(c.detail)}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  if (!PP) return;
+  chans.forEach((c, i) => {
+    if (c.type !== 'promptpay') return;
+    const target = PP.normalizePromptPay(c.detail);
+    if (!target) return;
+    try {
+      const payload = PP.buildPromptPayPayload(target, amount);
+      const modules = PP.qrGenerate(payload, PP.ECL_M);
+      PP.drawQr(document.getElementById('ipub-qr-' + i), modules, 6, 4);
+    } catch (e) {
+      console.error('QR render failed', e);
+    }
+  });
+}
+
+function renderSlipStatus(justSent) {
+  const el = document.getElementById('ipub-slip-status');
+  if (!el) return;
+  const count = (invoiceData && invoiceData.slipCount) || 0;
+  const already = count > 0
+    ? `<div class="ipub-hint">แนบแล้ว ${count} รายการ / ${count} slip(s) already attached</div>`
+    : '';
+  if (justSent) {
+    const owner = esc((invoiceData && invoiceData.ownerName) || '');
+    el.innerHTML = `<div class="ipub-success">ส่งสลิปแล้ว ✓ — ${owner} จะยืนยันในไม่ช้า / Slip sent — ${owner} will confirm shortly.</div>${already}`;
+  } else {
+    el.innerHTML = already;
+  }
+}
+
+// FileReader → Image → canvas downscale (longest side ≤ 1200px) → JPEG
+// q0.8 — the exact same pipeline as app/invoices.js's readSlipFile().
+// Deliberately duplicated rather than shared: this page is self-contained
+// by design (no app.js, no build step, no cross-file imports at runtime —
+// see the file header), same reasoning as book.html's own esc()/toast().
+function readSlipFileForUpload(file) {
+  return new Promise((resolve) => {
+    if (!file || !/^image\//.test(file.type)) { resolve(null); return; }
+    const reader = new FileReader();
+    reader.onerror = () => resolve(null);
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => resolve(null);
+      img.onload = () => {
+        const MAX = 1200;
+        let w = img.naturalWidth, h = img.naturalHeight;
+        if (!w || !h) { resolve(null); return; }
+        if (w > MAX || h > MAX) {
+          if (w >= h) { h = Math.round(h * MAX / w); w = MAX; }
+          else { w = Math.round(w * MAX / h); h = MAX; }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        try { resolve(canvas.toDataURL('image/jpeg', 0.8)); } catch (e) { resolve(null); }
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function onSlipFileChosen() {
+  const fileInput = document.getElementById('ipub-slip-file');
+  const file = fileInput.files && fileInput.files[0];
+  fileInput.value = '';
+  if (!file) return;
+
+  const attachBtn = document.getElementById('ipub-slip-attach');
+  const dataUrl = await readSlipFileForUpload(file);
+  if (!dataUrl) {
+    toast('ไฟล์นี้ใช้ไม่ได้ ลองรูปอื่น / That file could not be used — try a different photo.');
+    return;
+  }
+
+  if (attachBtn) attachBtn.disabled = true;
+  let res, data;
+  try {
+    res = await fetch(API_BASE + '/api/invoice-public', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ i: invCuid, dataUrl }),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (err) {
+    toast('ส่งสลิปไม่สำเร็จ — ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่ / Could not send the slip — check your connection and try again.');
+    if (attachBtn) attachBtn.disabled = false;
+    return;
+  }
+
+  if (!res.ok) {
+    if (res.status === 409 && data.code === 'slips_full') {
+      toast('แนบสลิปได้ครบจำนวนสูงสุดแล้ว / This invoice already has the maximum number of slips attached.');
+    } else {
+      toast('ส่งสลิปไม่สำเร็จ — ลองใหม่อีกครั้ง / Could not send the slip — please try again.');
+    }
+    if (attachBtn) attachBtn.disabled = false;
+    return;
+  }
+
+  invoiceData.slipCount = data.slipCount;
+  renderSlipStatus(true);
+  if (attachBtn) attachBtn.disabled = false;
+}
+
+load();
+</script>

@@ -1,0 +1,641 @@
+-- Sidekick — core app schema (Phase 1 of the local-first -> backend migration)
+--
+-- `cuid` is the real primary key throughout, matching the client-generated
+-- UUID (`cuid()` in app/app.js) every record already carries today. The
+-- client keeps minting its own id exactly as it does now; the server only
+-- validates and inserts. That is what makes the one-time local->server
+-- upload (api/migrate-upload.js) idempotent via `on conflict (cuid) do
+-- nothing`, and what keeps almost every existing call site unchanged (see
+-- app/dataClient.js).
+--
+-- Run this once against the Neon database from its own SQL console — there
+-- is no migration runner in this project.
+--
+-- 2026-07-14: `sql/schema.sql` (the formerly-separate, explicitly
+-- single-tenant LINE self-service-booking pilot schema) is retired and its
+-- tables folded in below as real multi-tenant tables, per the "generic LINE
+-- OA connection" build — see the LINE INTEGRATION section further down.
+-- That file's own `create table if not exists services (...)` used the
+-- *bare* name `services`, which — contrary to this file's previous header
+-- comment claiming the two "would collide" (future tense, as if already
+-- prevented) — was a real, never-actually-avoided collision: this file
+-- already defined its own, differently-shaped `services` table below. Since
+-- `sql/schema.sql` was still only "tracked, not started" (per the project
+-- changelog's LINE integration entry — Vercel deploy access was never
+-- available to actually run it), nothing live ever depended on its
+-- single-tenant shape, so no data migration is needed to retire it — this
+-- is a from-scratch definition, not a breaking change to a populated table.
+
+create table if not exists users (
+  cuid              text primary key,
+  username          text not null unique,
+  password_hash     text,
+  password_salt     text,
+  password_iters    int,
+  first_name        text,
+  -- LINE-authenticated accounts have no password (parity with the existing
+  -- local-only LINE account convention: hash === null marks a LINE account).
+  line_sub          text unique,
+  line_picture      text,
+  profile_complete  boolean not null default true,
+  -- Null until the one-time local->server upload (api/migrate-upload.js)
+  -- has run for this account. A later cutover phase must not let an
+  -- unmigrated account start reading from the server before this is set.
+  migrated_at       timestamptz,
+  created_at        timestamptz not null default now(),
+  -- ─── Subscription (Phase 0, 2026-07-14) ──────────────────────────────
+  -- 'basic' | 'pro' | 'team' — Team billing (seats/orgs) is Phase 2, not
+  -- built yet; this column exists now so Phase 1 gating has somewhere to
+  -- read from. subscription_status: 'trialing' | 'active' | 'past_due' |
+  -- 'canceled'. Default is 'active' with no trial clock (not 'trialing')
+  -- specifically so this ALTER grandfathers every pre-existing account —
+  -- see the trial-fields default below, and lib/entitlements.js, for why
+  -- that matters: nobody using the app before this shipped should hit a
+  -- surprise lock. New registrations (api/auth-register.js) explicitly
+  -- override both to start a real 15-day trial instead of relying on this
+  -- default. trial_ends_at is the ONLY thing lib/entitlements.js checks
+  -- against the clock — a 'trialing' row with a null trial_ends_at (should
+  -- never happen post-registration, but is possible if this default is
+  -- ever hit some other way) is treated as never-expiring, not locked.
+  plan                  text not null default 'basic' check (plan in ('basic','pro','team')),
+  subscription_status   text not null default 'active' check (subscription_status in ('trialing','active','past_due','canceled')),
+  trial_ends_at         timestamptz,
+  stripe_customer_id    text,
+  stripe_subscription_id text,
+  current_period_end    timestamptz,
+  -- ─── Team seats (Phase 2, 2026-07-15) ────────────────────────────────
+  -- Purchased seat count for a 'team'-plan account, INCLUDING the owner
+  -- (so "2 seats" = the owner + 1 invited member) — synced from Stripe's
+  -- subscription item quantity by api/stripe-webhook.js. Null/meaningless
+  -- for non-team plans. See the TEAM section further down for the actual
+  -- membership model — this column only tracks capacity, not membership.
+  team_seats            integer
+);
+
+-- Idempotent by design (`add column if not exists`) so this can be re-run
+-- safely against the already-live production table — same by-hand
+-- apply-once convention as the rest of this file (no migration runner
+-- exists in this project). A fresh `create table` above already includes
+-- these columns for anyone standing up the schema from scratch; this
+-- block only matters for the existing deployed database.
+alter table users add column if not exists plan text not null default 'basic';
+alter table users add column if not exists subscription_status text not null default 'active';
+alter table users add column if not exists trial_ends_at timestamptz;
+alter table users add column if not exists stripe_customer_id text;
+alter table users add column if not exists stripe_subscription_id text;
+alter table users add column if not exists current_period_end timestamptz;
+alter table users add column if not exists team_seats integer;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'users_plan_check') then
+    alter table users add constraint users_plan_check check (plan in ('basic','pro','team'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'users_subscription_status_check') then
+    alter table users add constraint users_subscription_status_check check (subscription_status in ('trialing','active','past_due','canceled'));
+  end if;
+end $$;
+
+create table if not exists clients (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  name              text not null,
+  phone             text,
+  email             text,
+  tags              text,
+  notes             text,
+  tax_id            text,
+  billing_address   text,
+  member_no         text,
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_clients_user on clients(user_cuid);
+
+-- ─── Phase 2: fan-out of the clients pattern to the remaining IndexedDB ────
+-- stores (api/*.js + this file only — see the phase's own plan for why the
+-- app/ side of the wiring, e.g. dataClient.js's camelCase<->snake_case
+-- mapping, is deliberately deferred to a later step).
+--
+-- JSONB columns mirror an array/object already embedded on the IndexedDB
+-- record as-is (subTasks/milestones/timeEntries on a job, lineItems/
+-- paymentChannels on an invoice, the per-doc-type `fields` object on a
+-- document) rather than normalizing into child tables — minimal
+-- translation, same shape the client already reads/writes today.
+--
+-- Where a store's record carries its own client-set `createdAt` distinct
+-- from `updatedAt` (bookings, portfolio, research, followups), that column
+-- is deliberately left out of each api/*.js FIELDS list (same treatment
+-- `updated_at` already gets everywhere) so it's assigned once by this
+-- column's own `default now()` on insert and is never touched again by an
+-- update — a server-assigned creation timestamp, not a client-trusted one.
+
+create table if not exists jobs (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  date              text,
+  client_name       text,
+  client_id         text,
+  service_id        text,
+  service_name      text,
+  job_type          text,
+  amount            numeric,
+  tip               numeric,
+  expense           numeric,
+  count             integer,
+  notes             text,
+  net_amount        numeric,
+  stage_order       jsonb,
+  stage             text,
+  complete          boolean not null default false,
+  invoice_id        text,
+  quote_doc_id      text,
+  package_id        text,
+  sub_tasks         jsonb,
+  milestones        jsonb,
+  time_entries      jsonb,
+  timer_started_at  timestamptz,
+  -- 2026-07-16: ref cuids, one per id-ref column above — see the comment on
+  -- this block's `alter table` statements below the index for why these exist.
+  client_cuid       text,
+  service_cuid      text,
+  invoice_cuid      text,
+  quote_doc_cuid    text,
+  package_cuid      text,
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_jobs_user on jobs(user_cuid);
+
+-- 2026-07-16: mirror each id-ref column's underlying cuid alongside it
+-- (client_cuid next to client_id, etc.) across the tables below — restore/
+-- team-pull link fidelity. A row's local autoincrement id only means
+-- something on the device that minted it (importDataset()'s oldId->newId
+-- remap only works within the SAME restore batch), but its cuid is globally
+-- stable, so a cloud pull (dataClient.js pullAll()) or a team member's read
+-- can carry these across and let app.js importDataset() resolve the link to
+-- the newly re-minted local row by cuid instead of nulling it. Best-effort
+-- denormalized identity only, matching this file's existing posture (see the
+-- header comment): nullable, no FK, no index — nothing here is ever queried
+-- server-side, these columns exist purely for the client to resolve locally.
+-- Residual gap, accepted this pass: milestone[].invoiceId and
+-- timeEntries[].invoiceId (both nested inside jobs.milestones/time_entries
+-- jsonb, not top-level id-ref columns) are NOT given a mirrored cuid here —
+-- those still reset on a cloud restore exactly as before.
+alter table jobs add column if not exists client_cuid text;
+alter table jobs add column if not exists service_cuid text;
+alter table jobs add column if not exists invoice_cuid text;
+alter table jobs add column if not exists quote_doc_cuid text;
+alter table jobs add column if not exists package_cuid text;
+
+-- 2026-07-17: restore-fidelity fix — these four were never mirrored at all,
+-- so pulling a job back from the cloud (dataClient.js pullAll()) silently
+-- dropped whether it was lost/why, its unresolved appointment gate, and its
+-- embedded options list. `options` follows the same jsonb-embedded-array
+-- convention as sub_tasks/milestones/time_entries above.
+alter table jobs add column if not exists outcome text;
+alter table jobs add column if not exists lost_reason text;
+alter table jobs add column if not exists pending_gate_stage text;
+alter table jobs add column if not exists options jsonb;
+
+-- 2026-07-17: Pass M3-L2 — products/extra services attached to a pipeline
+-- engagement while the deal is still forming (job-tracking-section's Items
+-- list), flowing automatically into the quote and later the invoice as
+-- linked line items. Same jsonb-embedded-array convention as options/
+-- sub_tasks/milestones above: [{ id, serviceId, name, qty, unitPrice }],
+-- name/unitPrice snapshotted at add time so a later catalog price edit
+-- never rewrites an engagement's own history.
+alter table jobs add column if not exists items jsonb;
+
+create table if not exists services (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  name              text not null,
+  rate              numeric,
+  unit              text,
+  usage_qty         integer,
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_services_user on services(user_cuid);
+
+-- 2026-07-17: Pass M3-L1 — unify the Services catalog into a product/
+-- service catalog (Option 1 of the product-catalogue assessment): a
+-- freelancer who also sells physical things manages them in the same
+-- catalog, invoices them through the same line-item picker, and gets
+-- simple stock tracking. `kind` distinguishes a stocked/sellable item
+-- ('product') from a billable service; missing/null = 'service', so every
+-- pre-existing row (and every seeded default) stays a service with no
+-- migration needed. `sku`/`cost` are optional catalog metadata (cost is
+-- unit cost, for later margin insights — stored now, no UI beyond the
+-- input yet). `stock_qty` is nullable on purpose: null means "not
+-- tracked", letting a product opt out of stock tracking entirely rather
+-- than needing a sentinel value.
+alter table services add column if not exists kind text;
+alter table services add column if not exists sku text;
+alter table services add column if not exists stock_qty integer;
+alter table services add column if not exists cost numeric;
+
+create table if not exists invoices (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  number            text,
+  issue_date        text,
+  due_date          text,
+  client_id         text,
+  client_name       text,
+  client_tax_id     text,
+  client_address    text,
+  line_items        jsonb,
+  subtotal          numeric,
+  wht_pct           numeric,
+  vat_pct           numeric,
+  vat               numeric,
+  wht               numeric,
+  client_pays       numeric,
+  you_receive       numeric,
+  deposit_pct       numeric,
+  status            text,
+  payment_channels  jsonb,
+  notes             text,
+  -- 2026-07-16: see jobs' ref-cuid comment above (the same "cuid rides
+  -- across a cloud pull, id doesn't" fix, applied here for client_id).
+  client_cuid       text,
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_invoices_user on invoices(user_cuid);
+
+alter table invoices add column if not exists client_cuid text;
+
+-- 2026-07-17: Pass M2a — payment slips (embedded array, same convention as
+-- line_items: [{id, dataUrl, at}]). Client downscales to longest-side-1200px
+-- JPEG q0.8 before it ever reaches this column, so rows stay small despite
+-- holding raw base64 image data.
+alter table invoices add column if not exists slips jsonb;
+
+-- 2026-07-17: Pass M3-L1 — stamped the first time a paid invoice's product
+-- lines decrement catalog stock (app.js decrementStockForInvoicePaid);
+-- double-decrement protection for a paid -> sent -> paid round trip. Text,
+-- not timestamptz, matching packages.expires_at above — a client-stamped
+-- nowISO()-shaped string stored verbatim rather than parsed into a real
+-- timestamp.
+-- NOTE: api/invoices.js's FIELDS whitelist is outside this pass's writable
+-- set, so this column is not yet wired to accept writes from the mirror —
+-- schema-only this pass; the local IndexedDB stamp is unaffected.
+alter table invoices add column if not exists stock_decremented_at text;
+
+create table if not exists documents (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  type              text,
+  title             text,
+  client_id         text,
+  client_name       text,
+  invoice_id        text,
+  fields            jsonb,
+  content           text,
+  number            text,
+  issue_date        text,
+  -- 2026-07-16: see jobs' ref-cuid comment above.
+  client_cuid       text,
+  invoice_cuid      text,
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_documents_user on documents(user_cuid);
+
+alter table documents add column if not exists client_cuid text;
+alter table documents add column if not exists invoice_cuid text;
+
+-- Named `app_bookings`, not `bookings` — schema.sql (the LINE self-service
+-- booking pilot, a separate single-tenant schema) already owns the bare
+-- `bookings` name; both schemas can load into the same Neon database.
+create table if not exists app_bookings (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  customer_id       text,
+  title             text,
+  date              text,
+  start_time        text,
+  duration_min      integer,
+  travel_buffer_min integer,
+  location          text,
+  notes             text,
+  status            text,
+  job_cuid          text,
+  -- Ref cuid for customer_id — see jobs' ref-cuid comment further up (same
+  -- fix, applied here so a cloud pull can resolve a booking back to the
+  -- re-minted client row instead of nulling customer_id).
+  customer_cuid     text,
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_app_bookings_user on app_bookings(user_cuid);
+
+-- 2026-07-16 addition: link a booking back to the pipeline job whose dated
+-- step created it (app.js createBookingForStep). Idempotent so already-created
+-- databases pick the column up on re-run; nullable, no FK — a dangling link is
+-- harmless and form-created bookings never have one.
+alter table app_bookings add column if not exists job_cuid text;
+alter table app_bookings add column if not exists customer_cuid text;
+
+create table if not exists followups (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  key               text,
+  dismissed         boolean not null default false,
+  snoozed_until     text,
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_followups_user on followups(user_cuid);
+
+create table if not exists portfolio (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  title             text not null,
+  description       text,
+  tags              text,
+  image_data_url    text,
+  order_index       integer,
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_portfolio_user on portfolio(user_cuid);
+
+create table if not exists research (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  title             text not null,
+  category          text,
+  body              text,
+  is_premium        boolean not null default false,
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_research_user on research(user_cuid);
+
+create table if not exists packages (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  client_id         text,
+  total_sessions    integer,
+  price             numeric,
+  purchased_date    text,
+  expires_at        text,
+  notes             text,
+  -- 2026-07-16: see jobs' ref-cuid comment further up.
+  client_cuid       text,
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_packages_user on packages(user_cuid);
+
+alter table packages add column if not exists client_cuid text;
+
+create table if not exists progress_logs (
+  cuid              text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  client_id         text,
+  date              text,
+  weight            numeric,
+  notes             text,
+  -- 2026-07-16: see jobs' ref-cuid comment further up.
+  client_cuid       text,
+  updated_at        timestamptz not null default now()
+);
+
+create index if not exists idx_progress_logs_user on progress_logs(user_cuid);
+
+alter table progress_logs add column if not exists client_cuid text;
+
+-- One-key-at-a-time, matching the client's own saveSetting(key, val) pattern
+-- (rather than one giant row per user) — no `cuid` here, the natural key is
+-- (user_cuid, key). No special encryption at this layer despite some keys
+-- holding PII-adjacent plaintext (PromptPay IDs, tax IDs in
+-- paymentChannels/sellerTaxId) — matches this migration's posture elsewhere;
+-- lib/crudHandler.js's error path already never logs body/field values, so
+-- a failed request here never leaks a settings value to the server log.
+create table if not exists settings (
+  user_cuid         text not null references users(cuid) on delete cascade,
+  key               text not null,
+  value             jsonb,
+  updated_at        timestamptz not null default now(),
+  primary key (user_cuid, key)
+);
+
+create index if not exists idx_settings_user on settings(user_cuid);
+
+-- ─── LINE INTEGRATION (2026-07-14: generic per-account connection) ────────
+-- Retires sql/schema.sql's single-tenant pilot (one hardcoded Channel via
+-- env vars, no tenant column anywhere) — see this file's own header note.
+-- Every account can now connect its own LINE Official Account (a Messaging
+-- API channel, a different channel type from the app-wide "Continue with
+-- LINE" *Login* channel lib/lineLogin.js talks to — unrelated, unaffected).
+
+-- One connected Messaging API channel per account (1:1 for now — a second
+-- connected channel per account isn't a case this pass supports).
+-- `bot_user_id` is LINE's own userId for this channel, resolved once via
+-- GET /v2/bot/info at connect time (api/line-channel-connect.js) — this is
+-- what api/line-webhook.js matches an inbound event's `destination` field
+-- against to route ONE shared webhook URL back to the right account,
+-- without trusting any client-supplied identifier. `channel_secret` is
+-- required to verify that same inbound webhook's signature, so it has to
+-- be stored (not just the access token) — same sensitivity posture the
+-- `settings` table's header comment above already accepts for other
+-- PII-adjacent plaintext, no separate encryption layer added here either.
+-- `freelancer_line_user_id` is optional and self-reported by the account
+-- owner (their own personal LINE user ID, found in their webhook event
+-- logs — there's no lookup-by-name API for it) so booking-request can push
+-- them a "new booking" alert; booking still works fully without it.
+create table if not exists line_channels (
+  user_cuid                 text primary key references users(cuid) on delete cascade,
+  channel_id                text not null unique,
+  channel_secret             text not null,
+  bot_user_id                text,
+  freelancer_line_user_id    text,
+  connected_at               timestamptz not null default now()
+);
+
+create index if not exists idx_line_channels_bot_user on line_channels(bot_user_id);
+
+-- A freelancer's self-service-bookable time windows — distinct from
+-- `app_bookings` above (their own internal calendar of scheduled work,
+-- managed in-app): this is the smaller, simpler set of open slots they've
+-- explicitly offered up for a client to grab via the public booking page.
+-- 'open' -> free to request. 'held' -> a client just requested it, soft
+-- reservation, releases automatically if hold_expires_at passes without a
+-- booking. 'booked' -> confirmed, no further action needed.
+create table if not exists availability_slots (
+  id                bigint generated always as identity primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  starts_at         timestamptz not null,
+  ends_at           timestamptz not null check (ends_at > starts_at),
+  status            text not null default 'open' check (status in ('open', 'held', 'booked')),
+  hold_expires_at   timestamptz
+);
+
+create index if not exists idx_availability_slots_open
+  on availability_slots (user_cuid, starts_at)
+  where status = 'open';
+
+-- An incoming self-service request against one of the slots above.
+-- `service_cuid` points at this same file's own `services` table (the
+-- account's already-existing Service catalog, rate/name) — no separate,
+-- narrower services table for the booking page, unlike the old pilot
+-- schema; a freelancer manages one service list, used everywhere.
+create table if not exists bookings (
+  id                    bigint generated always as identity primary key,
+  user_cuid             text not null references users(cuid) on delete cascade,
+  slot_id               bigint not null references availability_slots(id),
+  service_cuid          text references services(cuid),
+  client_name           text not null,
+  -- Nullable on purpose: a client arriving via a non-LINE channel (a
+  -- shared link outside the LINE rich menu) has no LINE user ID at all.
+  client_line_user_id   text,
+  status                text not null default 'requested' check (status in ('requested', 'confirmed', 'declined')),
+  created_at            timestamptz not null default now()
+);
+
+create index if not exists idx_bookings_user on bookings(user_cuid);
+
+-- 2026-07-17: Pass M2c — T-24h LINE booking reminders (api/cron-reminders.js,
+-- hourly Vercel Cron). NULL = not yet reminded; stamped only after a
+-- successful push, which is what makes the hourly re-run idempotent (a
+-- booking is never pushed twice, and a failed push just leaves it NULL for
+-- the next run to retry).
+alter table bookings add column if not exists reminder_sent_at timestamptz;
+
+-- 2026-07-17: Pass M3-L3 — public storefront order requests. A client on
+-- the public shop page (app/shop.html, api/shop-public.js) picks PRODUCTS
+-- (the `kind = 'product'` rows in the same `services` catalog above — no
+-- separate shop-only list, same "one catalog, used everywhere" convention
+-- `bookings` already follows for its own service_cuid) and submits an
+-- order; the freelancer confirms/declines it from Settings
+-- (api/order-requests.js), the same request/confirm/decline shape as
+-- `bookings` above, but with no `availability_slots`-style hold to
+-- release — an order has no scarce resource to reserve. `items` is a
+-- server-repriced jsonb snapshot ([{service_cuid, name, qty, unit_price}, ...]),
+-- never the client-submitted prices — see api/shop-public.js's POST
+-- handler. v1 deliberately holds no stock at request time (oversell risk
+-- accepted): stock only decrements once the resulting invoice is marked
+-- paid (Pass M3-L1's decrementStockForInvoicePaid), exactly like any other
+-- sale — a confirmed order just materializes a normal pipeline engagement
+-- (app.js) and flows through quote/invoice like one.
+create table if not exists order_requests (
+  id            bigint generated always as identity primary key,
+  user_cuid     text not null references users(cuid) on delete cascade,
+  client_name   text not null,
+  contact       text,
+  items         jsonb not null,
+  total         numeric,
+  status        text not null default 'requested' check (status in ('requested', 'confirmed', 'declined')),
+  created_at    timestamptz not null default now()
+);
+
+create index if not exists idx_order_requests_user on order_requests(user_cuid);
+
+-- ─── TEAM (Phase 2, 2026-07-15) ─────────────────────────────────────────
+-- Shared-single-identity model, not per-resource org scoping: a team is
+-- just one account (the "owner") plus a set of *other* accounts who've
+-- been granted access to operate on the owner's data. None of the 12
+-- resource tables above changed at all — every one of them still has
+-- exactly one `user_cuid` owner column, scoped exactly as before. What
+-- changed is lib/crudHandler.js (and the resource-specific handlers)
+-- resolving an *effective* data-owner cuid for the caller before running
+-- any query: a plain solo account's effective owner is itself; a team
+-- member's effective owner is whoever's `org_owner_cuid` their row here
+-- points to (lib/teams.js's resolveDataOwner()). This is deliberately the
+-- lower-risk of two designs (the alternative — org_cuid added to every
+-- existing table, re-scoping ~12 already-live tables' row-security with
+-- no live-DB testing available this session — was assessed and rejected
+-- for that reason, see the project changelog's Team-tier delta entry).
+--
+-- The owner is never a row in this table (implicit: whoever `org_owner_cuid`
+-- equals). Only 'admin'/'staff' are ever stored here — a role of 'owner'
+-- would be redundant and just another state to keep in sync.
+--
+-- `member_cuid` is UNIQUE on its own (not just the pair) — this session's
+-- v1 keeps membership to exactly one org per account, matching "you work
+-- for one Sidekick business, not several simultaneously." Prevents needing
+-- resolveDataOwner() to handle "which of several orgs" ambiguity.
+--
+-- No row is ever created for a pending/not-yet-registered invitee — an
+-- invite is a signed, stateless token (lib/teams.js's
+-- signInviteToken()/verifyInviteToken(), same HMAC-token shape
+-- lib/auth.js's session tokens and lib/lineLogin.js's OAuth `state` already
+-- use), redeemed into a real row only once the invitee is a logged-in
+-- account themselves (api/team-join.js). Nothing to expire/clean up here —
+-- the token's own baked-in expiry handles that.
+create table if not exists team_members (
+  cuid              text primary key,
+  org_owner_cuid    text not null references users(cuid) on delete cascade,
+  member_cuid       text not null unique references users(cuid) on delete cascade,
+  role              text not null check (role in ('admin', 'staff')),
+  joined_at         timestamptz not null default now()
+);
+
+create index if not exists idx_team_members_owner on team_members(org_owner_cuid);
+
+-- ─── GRIT BIZSUITE PIVOT (2026-07-18): OPS TASKBOARD ────────────────────────
+-- Grit Taskboard's kanban layer, added alongside (not replacing) the
+-- freelancer feature set above. `id` is the real primary key here — unlike
+-- every table above (`cuid` primary key, separate autoincrement local `id`
+-- on the IndexedDB side), this column mirrors the platform `tasks` table's
+-- own primary key name 1:1 (see packages/database/migrations/0001_core.sql +
+-- 0002_platform_extensions.sql) since ops_tasks rows can be minted by EITHER
+-- side: a card the user creates locally (client-minted text id, same
+-- "cuid()-shaped, server just validates and inserts" convention every other
+-- table here already follows — see this file's header), or a card born from
+-- an inbound cross-app event (api/grit-events.js mints the id server-side).
+-- `user_cuid` keeps this app's own row-scoping convention (every table
+-- above has one) rather than an `organization_id` column — see
+-- grit_org_links below for how an account maps to a Grit organization id;
+-- ops_tasks itself is never queried by organization_id directly, only by
+-- the resolved data-owner cuid, same as every other resource here.
+create table if not exists ops_tasks (
+  id                text primary key,
+  user_cuid         text not null references users(cuid) on delete cascade,
+  location_id       text,
+  title             text not null,
+  description       text,
+  status            text not null default 'todo' check (status in ('todo', 'in_progress', 'review', 'done')),
+  priority          text not null default 'normal' check (priority in ('low', 'normal', 'high')),
+  -- 'system_inventory' | 'system_pos' -> minted by api/grit-events.js from an
+  -- inbound inventory.threshold_breached/pos.velocity_surge webhook;
+  -- 'manual' -> created by a person in the Ops board UI (api/ops-tasks.js).
+  triggered_by      text not null default 'manual' check (triggered_by in ('system_inventory', 'system_pos', 'manual')),
+  assigned_shift    text,
+  -- Idempotency key for event-driven cards: the source event's event_id.
+  -- NULL for manually created cards; unique when present (same
+  -- "on conflict (source_event_id) do nothing" pattern the platform tasks
+  -- table's own tasks_source_event_id_key index exists for).
+  source_event_id   text unique,
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now(),
+  completed_at      timestamptz
+);
+
+create index if not exists idx_ops_tasks_user on ops_tasks(user_cuid);
+create index if not exists idx_ops_tasks_user_status on ops_tasks(user_cuid, status);
+
+-- One taskboard account <-> one Grit BizSuite organization id (an opaque
+-- string minted by the platform side — grit-pos/grit-inventory/grit-passport
+-- own what an "organization" actually is, this app only stores the link).
+-- `user_cuid` is the primary key (not a separate cuid) since this is a
+-- strict 1:1 mapping — api/grit-org-link.js's GET/PUT/DELETE always targets
+-- "the calling account's org link", singular. `organization_id` is globally
+-- unique too: one Grit organization is never linked to two different
+-- taskboard accounts (api/grit-org-link.js's PUT returns 409 if it is).
+-- This is also the table api/grit-events.js's webhook handler reads to map
+-- an inbound envelope's `organization_id` back to the taskboard account
+-- that should receive the resulting card — an unmapped organization_id is
+-- a 202-and-skip there, never an error (see that file's header).
+create table if not exists grit_org_links (
+  user_cuid         text primary key references users(cuid) on delete cascade,
+  organization_id   text not null unique,
+  created_at        timestamptz not null default now()
+);

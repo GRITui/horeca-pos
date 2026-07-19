@@ -1,0 +1,9 @@
+{
+  "name": "sidekick",
+  "private": true,
+  "description": "Sidekick — local-first admin PWA. api/ holds the small set of Vercel serverless functions the app opts into for the LINE integration (booking availability/request, LINE webhook); the app itself has no build step and no dependencies of its own. Deliberately left without \"type\": \"module\" — Node's native require(esm) interop already loads the ESM `export default` syntax in api/*.js and lib/*.js fine without that flag.",
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "stripe": "^17.7.0"
+  }
+}

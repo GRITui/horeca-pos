@@ -1,0 +1,22 @@
+{
+  "name": "@grit/passport",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Grit Passport: shared SSO session contract (jose HS256 JWT cookie), role-based access control, and commercial-tier feature gating for the Grit BizSuite apps.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./session": "./src/session.ts",
+    "./rbac": "./src/rbac.ts",
+    "./entitlements": "./src/entitlements.ts",
+    "./nav": "./src/nav.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "jose": "^6.2.3"
+  }
+}

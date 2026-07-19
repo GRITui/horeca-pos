@@ -1,0 +1,301 @@
+// Prisma schema for @grit/database — the shared Grit BizSuite platform schema.
+//
+// This schema MIRRORS the hand-written SQL migrations in ../migrations (which
+// are the source of truth — apply them in order with psql or the Neon SQL
+// editor; see the package README). It exists so apps get a typed Prisma client
+// over the shared tables. Do not `prisma migrate dev` against it; evolve the
+// SQL migrations and keep this file in sync.
+//
+// Conventions (matching apps/grit-pos and apps/grit-inventory):
+//  - Prisma 7 `prisma-client` generator, TS output committed under src/generated
+//  - datasource url comes from prisma.config.ts (DATABASE_URL)
+//  - snake_case table/column names via @@map/@map
+//
+// Status-style columns (locations.type, tasks.status, users.role, tier, …) are
+// plain varchar with SQL CHECK constraints, not Postgres enums — so they are
+// modeled as String here. Valid values are documented per field.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String    @db.VarChar(255)
+  /// Subscription tier: 'LITE' | 'GROWTH' | 'SCALE' (SQL CHECK constraint).
+  tier      String    @default("LITE") @db.VarChar(20)
+  createdAt DateTime? @default(now()) @map("created_at") @db.Timestamp(6)
+
+  addons         OrganizationAddon[]
+  locations      Location[]
+  products       Product[]
+  users          User[]
+  transactions   Transaction[]
+  stockTransfers StockTransfer[]
+  suppliers      Supplier[]
+
+  @@map("organizations")
+}
+
+/// Addon marketplace flag, e.g. 'custom_reporting'. Presence of a row means
+/// the addon is enabled for the organization.
+model OrganizationAddon {
+  organizationId String @map("organization_id") @db.Uuid
+  addon          String @db.VarChar(50)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@id([organizationId, addon])
+  @@map("organization_addons")
+}
+
+model Location {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String? @map("organization_id") @db.Uuid
+  name           String  @db.VarChar(255)
+  /// 'retail' | 'warehouse' | 'service_hub' | 'kitchen' (SQL CHECK constraint).
+  type           String? @db.VarChar(50)
+
+  organization      Organization?   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  transactions      Transaction[]
+  inventoryStocks   InventoryStock[]
+  tasks             Task[]
+  stockLots         StockLot[]
+  outboundTransfers StockTransfer[] @relation("TransferFromLocation")
+  inboundTransfers  StockTransfer[] @relation("TransferToLocation")
+
+  @@map("locations")
+}
+
+// ---------------------------------------------------------------------------
+// Identity (Grit Passport)
+// ---------------------------------------------------------------------------
+
+model User {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  email          String    @db.VarChar(255)
+  passwordHash   String    @map("password_hash") @db.VarChar(255)
+  name           String    @db.VarChar(255)
+  /// 'owner' | 'manager' | 'staff' (SQL CHECK constraint).
+  role           String    @db.VarChar(20)
+  createdAt      DateTime? @default(now()) @map("created_at") @db.Timestamp(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, email])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Product {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String? @map("organization_id") @db.Uuid
+  sku            String  @unique @db.VarChar(100)
+  name           String  @db.VarChar(255)
+  basePrice      Decimal @map("base_price") @db.Decimal(10, 2)
+  attributes     Json?   @default("{}")
+  supplierId     String? @map("supplier_id") @db.Uuid
+
+  organization       Organization?       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  supplier           Supplier?           @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  variants           ProductVariant[]
+  transactionItems   TransactionItem[]
+  inventoryStocks    InventoryStock[]
+  stockLots          StockLot[]
+  stockTransferItems StockTransferItem[]
+
+  @@map("products")
+}
+
+/// Child SKU for matrix variants (Size/Color/Style). Effective price is
+/// parent base_price + price_delta; the variant axes live in `attributes`,
+/// e.g. {"size": "L", "color": "Black"}.
+model ProductVariant {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId  String   @map("product_id") @db.Uuid
+  sku        String   @unique @db.VarChar(100)
+  name       String   @db.VarChar(255)
+  priceDelta Decimal? @default(0) @map("price_delta") @db.Decimal(10, 2)
+  attributes Json?    @default("{}")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_variants")
+}
+
+model Supplier {
+  id             String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  name           String @db.VarChar(255)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  products     Product[]
+
+  @@map("suppliers")
+}
+
+// ---------------------------------------------------------------------------
+// Sales
+// ---------------------------------------------------------------------------
+
+model Transaction {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId     String?   @map("location_id") @db.Uuid
+  organizationId String?   @map("organization_id") @db.Uuid
+  totalAmount    Decimal   @map("total_amount") @db.Decimal(10, 2)
+  taxAmount      Decimal   @map("tax_amount") @db.Decimal(10, 2)
+  paymentStatus  String?   @default("completed") @map("payment_status") @db.VarChar(50)
+  /// Client-generated idempotency key for offline-captured sales synced later.
+  externalRef    String?   @unique @map("external_ref") @db.VarChar(100)
+  createdAt      DateTime? @default(now()) @map("created_at") @db.Timestamp(6)
+
+  location     Location?     @relation(fields: [locationId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  items        TransactionItem[]
+
+  @@index([locationId, createdAt])
+  @@index([organizationId, createdAt])
+  @@map("transactions")
+}
+
+model TransactionItem {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  transactionId String? @map("transaction_id") @db.Uuid
+  productId     String? @map("product_id") @db.Uuid
+  quantity      Int
+  unitPrice     Decimal @map("unit_price") @db.Decimal(10, 2)
+
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  product     Product?     @relation(fields: [productId], references: [id])
+
+  @@index([transactionId])
+  @@map("transaction_items")
+}
+
+// ---------------------------------------------------------------------------
+// Inventory
+// ---------------------------------------------------------------------------
+
+model InventoryStock {
+  id                String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId        String? @map("location_id") @db.Uuid
+  productId         String? @map("product_id") @db.Uuid
+  quantityAvailable Int     @default(0) @map("quantity_available")
+  reorderThreshold  Int?    @default(10) @map("reorder_threshold")
+
+  location Location? @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  product  Product?  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([locationId, productId])
+  @@map("inventory_stocks")
+}
+
+/// FIFO cost layer. Sales drain quantity_remaining oldest-first (received_at)
+/// so COGS reflects actual purchase cost per lot.
+model StockLot {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId        String    @map("location_id") @db.Uuid
+  productId         String    @map("product_id") @db.Uuid
+  receivedAt        DateTime? @default(now()) @map("received_at") @db.Timestamp(6)
+  quantityReceived  Int       @map("quantity_received")
+  quantityRemaining Int       @map("quantity_remaining")
+  unitCost          Decimal   @map("unit_cost") @db.Decimal(10, 2)
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([locationId, productId, receivedAt])
+  @@map("stock_lots")
+}
+
+model StockTransfer {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  fromLocationId String    @map("from_location_id") @db.Uuid
+  toLocationId   String    @map("to_location_id") @db.Uuid
+  /// 'draft' | 'in_transit' | 'received' | 'cancelled' (SQL CHECK constraint).
+  status         String    @default("draft") @db.VarChar(20)
+  createdAt      DateTime? @default(now()) @map("created_at") @db.Timestamp(6)
+  receivedAt     DateTime? @map("received_at") @db.Timestamp(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  fromLocation Location     @relation("TransferFromLocation", fields: [fromLocationId], references: [id])
+  toLocation   Location     @relation("TransferToLocation", fields: [toLocationId], references: [id])
+  items        StockTransferItem[]
+
+  @@index([organizationId, status])
+  @@map("stock_transfers")
+}
+
+model StockTransferItem {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  transferId String @map("transfer_id") @db.Uuid
+  productId  String @map("product_id") @db.Uuid
+  quantity   Int
+
+  transfer StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  product  Product       @relation(fields: [productId], references: [id])
+
+  @@index([transferId])
+  @@map("stock_transfer_items")
+}
+
+// ---------------------------------------------------------------------------
+// Operations (Taskboard)
+// ---------------------------------------------------------------------------
+
+model Task {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  locationId    String?   @map("location_id") @db.Uuid
+  title         String    @db.VarChar(255)
+  description   String?
+  /// 'todo' | 'in_progress' | 'review' | 'done' (SQL CHECK constraint).
+  status        String?   @db.VarChar(50)
+  /// 'manual' | 'system_inventory' | 'system_pos' (convention; default 'manual').
+  triggeredBy   String?   @default("manual") @map("triggered_by") @db.VarChar(50)
+  assignedShift String?   @map("assigned_shift") @db.VarChar(100)
+  /// 'low' | 'normal' | 'high' (SQL CHECK constraint).
+  priority      String?   @default("normal") @db.VarChar(10)
+  /// event_id of the source event for system-created cards — unique so
+  /// re-delivered events cannot create duplicate cards. NULL for manual cards.
+  sourceEventId String?   @unique @map("source_event_id") @db.VarChar(100)
+  createdAt     DateTime? @default(now()) @map("created_at") @db.Timestamp(6)
+  completedAt   DateTime? @map("completed_at") @db.Timestamp(6)
+
+  location Location? @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([locationId, status])
+  @@map("tasks")
+}
+
+// ---------------------------------------------------------------------------
+// Eventing (see @grit/shared-events)
+// ---------------------------------------------------------------------------
+
+/// Durable outbox for cross-app events. `payload` holds the full
+/// GritEventEnvelope; rows with delivered_at IS NULL are retried by
+/// GritEventBus.drainOutbox().
+model EventOutbox {
+  eventId        String    @id @map("event_id") @db.VarChar(100)
+  eventName      String    @map("event_name") @db.VarChar(100)
+  organizationId String?   @map("organization_id")
+  payload        Json
+  createdAt      DateTime? @default(now()) @map("created_at") @db.Timestamp(6)
+  deliveredAt    DateTime? @map("delivered_at") @db.Timestamp(6)
+
+  @@map("event_outbox")
+}

@@ -1,0 +1,430 @@
+// Prisma schema for Horeca POS
+// Learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// How an order was placed. Kept broad/extensible for future channels
+/// (e.g. kiosk, phone) without a schema migration for the enum values
+/// themselves being the only lever — extend this list as needed.
+enum OrderChannel {
+  dine_in
+  qr
+  pickup_link
+}
+
+enum OrderStatus {
+  open
+  tendered
+  closed
+  cancelled
+}
+
+enum TenderType {
+  cash
+  card
+  qr_pay
+  stripe
+}
+
+enum PaymentStatus {
+  pending
+  succeeded
+  failed
+  refunded
+}
+
+enum UserRole {
+  owner
+  manager
+  staff
+}
+
+// ---------------------------------------------------------------------------
+// Core tenancy
+// ---------------------------------------------------------------------------
+
+/// One tenant = one restaurant. Every tenant-scoped table carries a
+/// `tenantId` FK + index so queries and RLS-style guards can filter cheaply.
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Optional plugin traits enabled for this tenant (see lib/traits.ts).
+  /// Hospitality traits default ON so existing tenants keep their behavior;
+  /// "retail.variant_matrix" is opt-in.
+  enabledTraits String[] @default(["hospitality.tables", "hospitality.pickup_links"])
+
+  /// Grit BizSuite commercial tier ("LITE" | "GROWTH" | "SCALE") — mirrors
+  /// organizations.tier in @grit/database. Kept as String (not an enum) so
+  /// adding tiers later is a plain migration, matching the platform schema.
+  tier   String   @default("LITE")
+  /// Addon marketplace flags, e.g. "custom_reporting" — mirrors
+  /// organization_addons in @grit/database (flattened to a string[] here).
+  addons String[] @default([])
+
+  /// VAT rate (percent) applied to VAT-inclusive selling prices, e.g. 7.00
+  /// for Thailand's standard rate. Tenant-configurable (not hardcoded)
+  /// since the rate is set by periodically-renewed cabinet resolution.
+  /// Excl-VAT/VAT split is derived at read time from `price` and
+  /// `Variant.vatApplicable` — see app/api/orders/_lib/queries.ts.
+  vatRate Decimal @db.Decimal(5, 2) @default(7.00)
+
+  /// Tenant-wide discount-stacking policy, synced from grit-inventory's
+  /// `discount_policy.updated` event (app/api/events/grit/route.ts) — same
+  /// "opaque String, cross-app pivot field" convention as `tier` above.
+  /// 'NO_STACKING' (default): at checkout, only the single best-discount
+  /// PromotionRule per line/SKU survives. 'STACK_ALL': every matching rule
+  /// applies (see lib/promotions.ts evaluatePromotions' resolution step).
+  discountStackingPolicy String @default("NO_STACKING")
+
+  users                 User[]
+  tables                Table[]
+  categories            Category[]
+  products              Product[]
+  orders                Order[]
+  dailyReconciliations  DailyReconciliation[]
+  promotionRules        PromotionRule[]
+
+  @@map("tenants")
+}
+
+/// Staff account, scoped to a single Tenant.
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  email        String
+  passwordHash String
+  role         UserRole @default(staff)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant                    Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  closedReconciliations     DailyReconciliation[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("users")
+}
+
+/// A physical table used for QR dine-in ordering. `token` is a random,
+/// opaque, unique value used as a "tokenized link" (e.g. /t/{token}) that
+/// grants scoped anonymous access to that table's ordering session.
+/// Generation/rotation logic is out of scope here — this only models the
+/// field + uniqueness constraint.
+model Table {
+  id       String @id @default(cuid())
+  tenantId String
+  label    String
+  token    String @unique
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  orders Order[]
+
+  @@index([tenantId])
+  @@index([token])
+  @@map("tables")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Category {
+  id        String @id @default(cuid())
+  tenantId  String
+  name      String
+  sortOrder Int    @default(0)
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  products Product[]
+
+  @@index([tenantId])
+  @@map("categories")
+}
+
+model Product {
+  id          String  @id @default(cuid())
+  tenantId    String
+  categoryId  String
+  name        String
+  description String?
+  basePrice   Decimal @db.Decimal(10, 2)
+  isActive    Boolean @default(true)
+
+  tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category   Category    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  variants   Variant[]
+  addOns     AddOn[]
+  orderLines OrderLine[]
+
+  @@index([tenantId])
+  @@index([categoryId])
+  @@map("products")
+}
+
+/// e.g. Size: Small / Large. `priceDelta` is added to the product's
+/// basePrice when this variant is selected (can be negative).
+model Variant {
+  id         String  @id @default(cuid())
+  productId  String
+  name       String
+  priceDelta Decimal @db.Decimal(10, 2) @default(0)
+
+  /// Denormalized tenant scope so `sku` can be unique per tenant (the
+  /// canonical @grit/database schema makes product_variants.sku globally
+  /// unique — divergence noted in README). Nullable: legacy hospitality
+  /// variants have neither tenantId nor sku.
+  tenantId String?
+  /// Optional child SKU for retail variant-matrix products (e.g. TSHIRT-L-BLK).
+  sku String? @db.VarChar(100)
+  /// Attribute axes for matrix variants, e.g. {"size":"L","color":"black"} —
+  /// mirrors product_variants.attributes in @grit/database.
+  attributes Json?
+
+  /// Whether this SKU's price is VAT-inclusive (default: true, since most
+  /// retail goods are standard-rated). Flip off per item for legally
+  /// VAT-exempt goods. Selling price stays the single source of truth;
+  /// excl-VAT/VAT amounts are derived at read time, never stored.
+  vatApplicable Boolean @default(true)
+
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderLines OrderLine[]
+
+  @@unique([tenantId, sku])
+  @@index([productId])
+  @@map("variants")
+}
+
+/// e.g. extra cheese, oat milk. Flat additional price.
+model AddOn {
+  id        String  @id @default(cuid())
+  productId String
+  name      String
+  price     Decimal @db.Decimal(10, 2)
+
+  product        Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderLineAddOns OrderLineAddOn[]
+
+  @@index([productId])
+  @@map("add_ons")
+}
+
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+model Order {
+  id         String       @id @default(cuid())
+  tenantId   String
+  channel    OrderChannel
+  tableId    String?
+  status     OrderStatus  @default(open)
+  /// For pickup_link orders: when the order is promised to the customer.
+  promisedAt DateTime?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  table  Table?  @relation(fields: [tableId], references: [id], onDelete: SetNull)
+
+  lines    OrderLine[]
+  payments Payment[]
+
+  @@index([tenantId])
+  @@index([channel])
+  @@index([status])
+  @@index([tableId])
+  @@map("orders")
+}
+
+model OrderLine {
+  id         String  @id @default(cuid())
+  orderId    String
+  productId  String
+  variantId  String?
+  quantity   Int     @default(1)
+  /// Unit price at time of order (base price + variant delta), snapshotted
+  /// so historical reporting is unaffected by later catalog price changes.
+  unitPrice  Decimal @db.Decimal(10, 2)
+  /// quantity * unitPrice + sum(selected add-on prices) * quantity
+  lineTotal  Decimal @db.Decimal(10, 2)
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variant Variant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  /// Join table (rather than JSON) for selected add-ons so per-add-on sales
+  /// are directly queryable/aggregable for reporting.
+  addOns OrderLineAddOn[]
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([variantId])
+  @@map("order_lines")
+}
+
+/// Join row recording one add-on selected on one order line, with the price
+/// snapshotted at order time (add-on prices may change later).
+model OrderLineAddOn {
+  id          String  @id @default(cuid())
+  orderLineId String
+  addOnId     String
+  /// Snapshot of AddOn.price at the time this line was ordered.
+  price       Decimal @db.Decimal(10, 2)
+
+  orderLine OrderLine @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
+  addOn     AddOn     @relation(fields: [addOnId], references: [id], onDelete: Restrict)
+
+  @@index([orderLineId])
+  @@index([addOnId])
+  @@map("order_line_add_ons")
+}
+
+model Payment {
+  id                    String        @id @default(cuid())
+  orderId               String
+  tenderType            TenderType
+  amount                Decimal       @db.Decimal(10, 2)
+  status                PaymentStatus @default(pending)
+  stripePaymentIntentId String?
+  /// Client-generated idempotency key for offline-captured operations
+  /// (offline queue sync). Unique when present so a retried sync can never
+  /// double-book a payment — mirrors transactions.external_ref in
+  /// @grit/database (camelCase column, matching this app's convention).
+  externalRef           String?       @unique @db.VarChar(100)
+  createdAt             DateTime      @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([tenderType])
+  @@index([status])
+  @@map("payments")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-app promotion cache (Grit BizSuite)
+// ---------------------------------------------------------------------------
+
+/// Local read-only cache of a Grit Inventory `Promotion` rule, kept in sync by
+/// the inbound `promotion.updated` webhook (app/api/events/grit/route.ts).
+/// grit-pos is offline-first and never calls another app live at checkout
+/// time, so this cache — upserted/removed as events arrive — is the only
+/// source of truth the register consults when pricing a cart (lib/promotions.ts).
+///
+/// `id` intentionally mirrors the source `promotion_id` from the event
+/// envelope (NOT a locally generated cuid) so repeated/replayed webhook
+/// deliveries upsert idempotently onto the same row instead of duplicating it.
+model PromotionRule {
+  id       String @id
+  tenantId String
+  name     String
+
+  /// 'buy_x_pay_y' | 'buy_x_get_discount' | 'bundle_deal' — kept as String
+  /// (not an enum), matching this app's enum-as-string convention for
+  /// pivot/cross-app fields (see Tenant.tier).
+  type     String
+  isActive Boolean
+
+  startsAt DateTime?
+  endsAt   DateTime?
+
+  /// buy_x_pay_y
+  buyQuantity Int?
+  payQuantity Int?
+
+  /// buy_x_get_discount
+  minQuantity   Int?
+  discountKind  String?
+  discountValue Decimal? @db.Decimal(10, 2)
+
+  /// bundle_deal
+  bundlePrice Decimal? @db.Decimal(12, 2)
+
+  /// The SKUs this rule applies to: array of {sku, required_quantity},
+  /// mirroring PromotionUpdatedData.items verbatim (snake_case keys) since
+  /// this is a cache of the wire payload, not a normalized relation.
+  items Json
+
+  /// Other PromotionRule ids this rule must never co-apply with on the same
+  /// order — array of ids, mirroring PromotionUpdatedData.excluded_promotion_ids
+  /// verbatim, same "cache of the wire payload" convention as `items`.
+  /// Enforced pairwise (order-independent) after the stacking-policy
+  /// resolution step in lib/promotions.ts, regardless of policy.
+  excludedRuleIds Json @default("[]")
+
+  updatedAt DateTime @updatedAt
+  /// When this row was last written by the inbound webhook (distinct from
+  /// `updatedAt`, which also mirrors the source's own edit time via the
+  /// envelope — this is purely "last time POS heard about it").
+  syncedAt  DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@map("promotion_rules")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-app event outbox (Grit BizSuite)
+// ---------------------------------------------------------------------------
+
+/// Durable outbox for @grit/shared-events, written by @grit/database's
+/// `createNeonOutboxStore` against this app's own DATABASE_URL. Mirrors the
+/// canonical `event_outbox` table in packages/database exactly (snake_case
+/// columns, opaque text organization scope, no FK to organizations) — the
+/// store's raw SQL must line up.
+/// This app only reads it directly for velocity-surge dedupe (lib/velocity.ts).
+model EventOutbox {
+  eventId        String    @id @map("event_id") @db.VarChar(100)
+  eventName      String    @map("event_name") @db.VarChar(100)
+  organizationId String?   @map("organization_id")
+  payload        Json
+  createdAt      DateTime? @default(now()) @map("created_at") @db.Timestamp(6)
+  deliveredAt    DateTime? @map("delivered_at") @db.Timestamp(6)
+
+  @@index([createdAt], map: "event_outbox_created_at_idx")
+  @@map("event_outbox")
+}
+
+// ---------------------------------------------------------------------------
+// End-of-day reconciliation
+// ---------------------------------------------------------------------------
+
+/// One auditable, persisted record per tenant per business day, produced
+/// when a manager closes out the till. Never overwritten after creation.
+model DailyReconciliation {
+  id                String   @id @default(cuid())
+  tenantId          String
+  businessDate      DateTime @db.Date
+  expectedCashTotal Decimal  @db.Decimal(10, 2)
+  countedCashTotal  Decimal  @db.Decimal(10, 2)
+  cardTotal         Decimal  @db.Decimal(10, 2)
+  qrPayTotal        Decimal  @db.Decimal(10, 2)
+  stripeTotal       Decimal  @db.Decimal(10, 2)
+  notes             String?
+  closedByUserId    String
+  createdAt         DateTime @default(now())
+
+  tenant       Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  closedByUser User   @relation(fields: [closedByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, businessDate])
+  @@index([tenantId])
+  @@map("daily_reconciliations")
+}

@@ -1,0 +1,179 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>Book a session — Sidekick</title>
+<meta name="description" content="Request a booking.">
+<link rel="icon" href="icons/icon.svg">
+<meta name="theme-color" content="#F7F6F2">
+<script>(function(){var K='sidekick_ui_theme',t=localStorage.getItem(K);if(t==='dark')document.documentElement.dataset.theme='dark';else if(t!=='auto')document.documentElement.dataset.theme='light';})();</script>
+<link rel="stylesheet" href="styles.css?v=0.9.37">
+<style>
+  /* Public booking page has no bottom nav / app shell — undo the app
+     shell's max-width-and-centered body so this reads as its own page,
+     not a phone-width column floating in a sea of blank space on desktop. */
+  body{ max-width:520px; padding-bottom:40px; }
+  .book-hero{ padding:28px 20px 8px; text-align:center; }
+  .book-hero h1{ font-size:22px; font-weight:800; margin:0 0 4px; }
+  .book-hero p{ font-size:13px; color:var(--text3); margin:0; }
+  .book-section{ padding:16px 20px 0; }
+  .book-section-title{ font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; color:var(--text3); margin:0 0 8px; }
+  .slot-grid{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .slot-btn{ padding:11px 8px; border:1.5px solid var(--border); border-radius:var(--radius-sm); background:var(--card); color:var(--text); font-family:inherit; font-size:12.5px; font-weight:600; cursor:pointer; text-align:center; }
+  .slot-btn.active{ border-color:var(--brand); background:var(--brand-tint); color:var(--brand); }
+  .svc-btn{ width:100%; display:flex; justify-content:space-between; align-items:center; padding:13px 14px; border:1.5px solid var(--border); border-radius:var(--radius-sm); background:var(--card); color:var(--text); font-family:inherit; font-size:13.5px; font-weight:600; cursor:pointer; margin-bottom:8px; }
+  .svc-btn.active{ border-color:var(--brand); background:var(--brand-tint); color:var(--brand); }
+  .svc-btn .amt{ font-family:'Spline Sans Mono',monospace; font-weight:600; color:var(--text3); }
+  .book-empty, .book-error{ padding:40px 20px; text-align:center; color:var(--text3); font-size:13.5px; }
+  .book-confirm{ padding:40px 20px; text-align:center; }
+  .book-confirm .icon{ font-size:40px; margin-bottom:10px; }
+  .book-confirm h2{ font-size:18px; font-weight:800; margin:0 0 6px; }
+  .book-confirm p{ font-size:13.5px; color:var(--text2); margin:0; }
+</style>
+
+<body data-page="book">
+
+<div class="book-hero">
+  <h1 id="book-title">Book a session</h1>
+  <p id="book-sub">Pick a service and a time that works for you.</p>
+</div>
+
+<div id="book-body"></div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<script>
+const API_BASE = window.__SIDEKICK_API_BASE || 'https://sidekickz.vercel.app';
+const params = new URLSearchParams(location.search);
+const userCuid = params.get('u');
+
+let services = [];
+let slots = [];
+let selectedService = null;
+let selectedSlot = null;
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+function toast(msg) {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2800);
+}
+function fmtSlot(startsAt, endsAt) {
+  const d = new Date(startsAt), e = new Date(endsAt);
+  const day = d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+  const startTime = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  const endTime = e.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  return { day, time: startTime + '–' + endTime };
+}
+
+async function loadAvailability() {
+  const body = document.getElementById('book-body');
+  if (!userCuid) {
+    body.innerHTML = '<div class="book-error">This booking link is missing its account — ask for a fresh link.</div>';
+    return;
+  }
+  let res, data;
+  try {
+    res = await fetch(API_BASE + '/api/booking-availability?u=' + encodeURIComponent(userCuid));
+    data = await res.json();
+  } catch (err) {
+    body.innerHTML = '<div class="book-error">Could not load availability — check your connection and reload.</div>';
+    return;
+  }
+  if (!res.ok) {
+    body.innerHTML = '<div class="book-error">Could not load availability right now — please try again shortly.</div>';
+    return;
+  }
+  services = data.services || [];
+  slots = data.slots || [];
+  render();
+}
+
+function render() {
+  const body = document.getElementById('book-body');
+  if (!services.length || !slots.length) {
+    body.innerHTML = '<div class="book-empty">No open booking times right now — check back soon, or reach out directly.</div>';
+    return;
+  }
+  const svcHtml = services.map(s => `
+    <button type="button" class="svc-btn${selectedService === s.cuid ? ' active' : ''}" data-svc="${esc(s.cuid)}">
+      <span>${esc(s.name)}</span>
+      ${s.rate ? `<span class="amt">฿${esc(Number(s.rate).toLocaleString('en-US'))}</span>` : ''}
+    </button>`).join('');
+  const slotHtml = slots.map(s => {
+    const f = fmtSlot(s.starts_at, s.ends_at);
+    return `<button type="button" class="slot-btn${selectedSlot === s.id ? ' active' : ''}" data-slot="${s.id}">${esc(f.day)}<br>${esc(f.time)}</button>`;
+  }).join('');
+  body.innerHTML = `
+    <div class="book-section">
+      <div class="book-section-title">Service</div>
+      ${svcHtml}
+    </div>
+    <div class="book-section">
+      <div class="book-section-title">Time</div>
+      <div class="slot-grid">${slotHtml}</div>
+    </div>
+    <div class="book-section">
+      <div class="book-section-title">Your name</div>
+      <div class="field" style="border:1.5px solid var(--border);border-radius:var(--radius-sm);padding:0">
+        <input id="book-name" type="text" placeholder="Your name" style="width:100%;padding:13px 14px;border:none;background:none;color:var(--text);font-family:inherit;font-size:14px">
+      </div>
+    </div>
+    <div class="book-section">
+      <button type="button" class="btn-submit" id="book-submit" style="width:100%">Request booking</button>
+    </div>
+  `;
+  body.querySelectorAll('[data-svc]').forEach(btn => btn.addEventListener('click', () => { selectedService = btn.getAttribute('data-svc'); render(); }));
+  body.querySelectorAll('[data-slot]').forEach(btn => btn.addEventListener('click', () => { selectedSlot = Number(btn.getAttribute('data-slot')); render(); }));
+  const submitBtn = document.getElementById('book-submit');
+  if (submitBtn) submitBtn.addEventListener('click', submitBooking);
+}
+
+async function submitBooking() {
+  const nameEl = document.getElementById('book-name');
+  const clientName = (nameEl && nameEl.value || '').trim();
+  if (!selectedService) { toast('Pick a service first.'); return; }
+  if (!selectedSlot) { toast('Pick a time first.'); return; }
+  if (!clientName) { toast('Enter your name.'); return; }
+
+  const submitBtn = document.getElementById('book-submit');
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Requesting…'; }
+
+  let res, data;
+  try {
+    res = await fetch(API_BASE + '/api/booking-request', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ userCuid, slotId: selectedSlot, serviceCuid: selectedService, clientName }),
+    });
+    data = await res.json();
+  } catch (err) {
+    toast('Could not reach the server — check your connection and try again.');
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Request booking'; }
+    return;
+  }
+
+  if (!res.ok) {
+    toast(data.error || 'That didn\'t work — please try again.');
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Request booking'; }
+    if (res.status === 409) await loadAvailability(); // slot's gone — refresh the list
+    return;
+  }
+
+  const body = document.getElementById('book-body');
+  const d = new Date(data.startsAt);
+  const dayLabel = d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+  const timeLabel = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  body.innerHTML = `
+    <div class="book-confirm">
+      <div class="icon">✅</div>
+      <h2>Request sent</h2>
+      <p>${esc(data.service)} — ${esc(dayLabel)} at ${esc(timeLabel)}.<br>You'll be confirmed directly.</p>
+    </div>`;
+}
+
+loadAvailability();
+</script>

@@ -1,0 +1,260 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>Shop — Sidekick</title>
+<meta name="description" content="Order from this shop.">
+<link rel="icon" href="icons/icon.svg">
+<meta name="theme-color" content="#F7F6F2">
+<script>(function(){var K='sidekick_ui_theme',t=localStorage.getItem(K);if(t==='dark')document.documentElement.dataset.theme='dark';else if(t!=='auto')document.documentElement.dataset.theme='light';})();</script>
+<link rel="stylesheet" href="styles.css?v=0.9.37">
+<style>
+  /* Public shop page has no bottom nav / app shell — undo the app shell's
+     max-width-and-centered body so this reads as its own page, not a
+     phone-width column floating in a sea of blank space on desktop. Extra
+     bottom padding clears the sticky order bar (book.html has no
+     equivalent — this page's own addition). */
+  body{ max-width:520px; padding-bottom:96px; }
+  .shop-hero{ padding:28px 20px 8px; text-align:center; }
+  .shop-hero h1{ font-size:22px; font-weight:800; margin:0 0 4px; }
+  .shop-hero p{ font-size:13px; color:var(--text3); margin:0; }
+  .shop-section{ padding:16px 20px 0; }
+  .shop-grid{ display:flex; flex-direction:column; gap:10px; }
+  .shop-card{ border:1.5px solid var(--border); border-radius:var(--radius-sm); background:var(--card); padding:12px 14px; display:flex; align-items:center; gap:10px; }
+  .shop-card-main{ flex:1; min-width:0; }
+  .shop-card-name{ font-size:14px; font-weight:700; color:var(--text); }
+  .shop-card-sku{ font-size:11px; color:var(--text4); margin-top:1px; }
+  .shop-card-meta{ font-size:12.5px; color:var(--text3); margin-top:3px; }
+  .shop-card-price{ font-family:'Spline Sans Mono',monospace; font-weight:700; color:var(--text2); }
+  .shop-card-stock{ font-size:11px; color:var(--overdue); margin-top:2px; }
+  .qty-stepper{ display:flex; align-items:center; gap:8px; flex:none; }
+  .qty-btn{ width:30px; height:30px; border-radius:999px; border:1.5px solid var(--border); background:var(--card); color:var(--text); font-size:16px; font-weight:700; cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0; }
+  .qty-btn:disabled{ opacity:.35; cursor:not-allowed; }
+  .qty-count{ min-width:18px; text-align:center; font-family:'Spline Sans Mono',monospace; font-weight:700; font-size:14px; }
+  .shop-empty, .shop-error{ padding:40px 20px; text-align:center; color:var(--text3); font-size:13.5px; }
+  .shop-confirm{ padding:40px 20px; text-align:center; }
+  .shop-confirm .icon{ font-size:40px; margin-bottom:10px; }
+  .shop-confirm h2{ font-size:18px; font-weight:800; margin:0 0 6px; }
+  .shop-confirm p{ font-size:13.5px; color:var(--text2); margin:0; }
+  .shop-bar{ position:fixed; left:0; right:0; bottom:0; max-width:520px; margin:0 auto; background:var(--card); border-top:1.5px solid var(--border); padding:10px 16px calc(10px + env(safe-area-inset-bottom)); display:flex; align-items:center; gap:12px; z-index:20; }
+  .shop-bar-total{ flex:1; font-family:'Spline Sans Mono',monospace; font-weight:800; font-size:15px; color:var(--text); }
+  .shop-bar-sub{ font-size:11px; color:var(--text3); font-weight:600; }
+  .shop-order-form{ padding:16px 20px 4px; }
+  .shop-order-form .field{ border:1.5px solid var(--border); border-radius:var(--radius-sm); padding:0; margin-bottom:10px; }
+  .shop-order-form input{ width:100%; padding:13px 14px; border:none; background:none; color:var(--text); font-family:inherit; font-size:14px; box-sizing:border-box; }
+</style>
+
+<body data-page="shop">
+
+<div class="shop-hero">
+  <h1 id="shop-title">Shop</h1>
+  <p id="shop-sub">เลือกสินค้าและจำนวนที่ต้องการ / Pick what you'd like and how many.</p>
+</div>
+
+<div id="shop-body"></div>
+<div id="shop-order-form-wrap"></div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<script>
+const API_BASE = window.__SIDEKICK_API_BASE || 'https://sidekickz.vercel.app';
+const params = new URLSearchParams(location.search);
+const userCuid = params.get('u');
+
+let ownerName = '';
+let products = [];
+// cuid -> qty, only for cuids with qty > 0 (a stepper at 0 is simply absent).
+const cart = new Map();
+let submitting = false;
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+function toast(msg) {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2800);
+}
+function money(n) {
+  return '฿' + Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+}
+
+async function loadShop() {
+  const body = document.getElementById('shop-body');
+  if (!userCuid) {
+    body.innerHTML = '<div class="shop-error">ลิงก์นี้ไม่มีบัญชีร้านค้า — ขอลิงก์ใหม่ / This shop link is missing its account — ask for a fresh link.</div>';
+    return;
+  }
+  let res, data;
+  try {
+    res = await fetch(API_BASE + '/api/shop-public?u=' + encodeURIComponent(userCuid));
+    data = await res.json();
+  } catch (err) {
+    body.innerHTML = '<div class="shop-error">โหลดร้านค้าไม่สำเร็จ — ตรวจสอบการเชื่อมต่อแล้วลองใหม่ / Could not load the shop — check your connection and reload.</div>';
+    return;
+  }
+  if (!res.ok) {
+    body.innerHTML = '<div class="shop-error">ไม่พบร้านค้านี้ / This shop could not be found.</div>';
+    return;
+  }
+  ownerName = data.ownerName || '';
+  products = data.products || [];
+  if (ownerName) {
+    const sub = document.getElementById('shop-sub');
+    if (sub) sub.textContent = ownerName + ' · เลือกสินค้าและจำนวนที่ต้องการ / pick what you\'d like and how many.';
+  }
+  render();
+}
+
+function stockLimit(p) {
+  return p.stockQty == null ? Infinity : Number(p.stockQty);
+}
+
+function render() {
+  const body = document.getElementById('shop-body');
+  if (!products.length) {
+    body.innerHTML = '<div class="shop-empty">ยังไม่มีสินค้าในร้านนี้ — กลับมาดูใหม่ภายหลัง / No products in this shop yet — check back soon.</div>';
+    renderBar();
+    return;
+  }
+  const cardsHtml = products.map(p => {
+    const limit = stockLimit(p);
+    const qty = cart.get(p.cuid) || 0;
+    const lowStock = p.stockQty != null && p.stockQty <= 5;
+    return `
+      <div class="shop-card" data-cuid="${esc(p.cuid)}">
+        <div class="shop-card-main">
+          <div class="shop-card-name">${esc(p.name)}</div>
+          ${p.sku ? `<div class="shop-card-sku">${esc(p.sku)}</div>` : ''}
+          <div class="shop-card-meta"><span class="shop-card-price">${esc(money(p.rate))}</span>${p.unit ? ' / ' + esc(p.unit) : ''}</div>
+          ${lowStock ? `<div class="shop-card-stock">เหลือ ${esc(p.stockQty)} ชิ้น / ${esc(p.stockQty)} left</div>` : ''}
+        </div>
+        <div class="qty-stepper">
+          <button type="button" class="qty-btn" data-step="-1" data-cuid="${esc(p.cuid)}" ${qty <= 0 ? 'disabled' : ''}>−</button>
+          <span class="qty-count">${qty}</span>
+          <button type="button" class="qty-btn" data-step="1" data-cuid="${esc(p.cuid)}" ${qty >= limit ? 'disabled' : ''}>+</button>
+        </div>
+      </div>`;
+  }).join('');
+  body.innerHTML = `<div class="shop-section"><div class="shop-grid">${cardsHtml}</div></div>`;
+  body.querySelectorAll('[data-step]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const cuid = btn.getAttribute('data-cuid');
+      const step = Number(btn.getAttribute('data-step'));
+      const p = products.find(x => x.cuid === cuid);
+      if (!p) return;
+      const limit = stockLimit(p);
+      const next = Math.max(0, Math.min(limit, (cart.get(cuid) || 0) + step));
+      if (next <= 0) cart.delete(cuid); else cart.set(cuid, next);
+      render();
+    });
+  });
+  renderBar();
+}
+
+function cartTotal() {
+  let total = 0;
+  cart.forEach((qty, cuid) => {
+    const p = products.find(x => x.cuid === cuid);
+    if (p) total += qty * Number(p.rate || 0);
+  });
+  return total;
+}
+function cartCount() {
+  let n = 0;
+  cart.forEach(qty => { n += qty; });
+  return n;
+}
+
+function renderBar() {
+  let bar = document.getElementById('shop-bar');
+  const count = cartCount();
+  if (!count) {
+    if (bar) bar.remove();
+    document.getElementById('shop-order-form-wrap').innerHTML = '';
+    return;
+  }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'shop-bar';
+    bar.className = 'shop-bar';
+    document.body.appendChild(bar);
+  }
+  bar.innerHTML = `
+    <div>
+      <div class="shop-bar-total">${esc(money(cartTotal()))}</div>
+      <div class="shop-bar-sub">${count} รายการ / ${count} item(s)</div>
+    </div>
+    <button type="button" class="btn-submit" id="shop-order-btn" style="width:auto;padding:0 20px">สั่งซื้อ / Order</button>`;
+  document.getElementById('shop-order-btn').addEventListener('click', toggleOrderForm);
+}
+
+function toggleOrderForm() {
+  const wrap = document.getElementById('shop-order-form-wrap');
+  if (wrap.innerHTML) { wrap.innerHTML = ''; return; }
+  wrap.innerHTML = `
+    <div class="shop-order-form">
+      <div class="field"><input id="shop-name" type="text" placeholder="ชื่อของคุณ / Your name"></div>
+      <div class="field"><input id="shop-contact" type="text" placeholder="LINE ID / เบอร์โทร / LINE ID or phone"></div>
+      <button type="button" class="btn-submit" id="shop-submit" style="width:100%">ยืนยันการสั่งซื้อ / Confirm order</button>
+    </div>`;
+  document.getElementById('shop-submit').addEventListener('click', submitOrder);
+  wrap.scrollIntoView({ behavior: 'smooth', block: 'end' });
+}
+
+async function submitOrder() {
+  if (submitting) return;
+  const nameEl = document.getElementById('shop-name');
+  const contactEl = document.getElementById('shop-contact');
+  const name = (nameEl && nameEl.value || '').trim();
+  const contact = (contactEl && contactEl.value || '').trim();
+  if (!name) { toast('กรุณากรอกชื่อ / Enter your name.'); return; }
+  if (!cartCount()) { toast('เลือกสินค้าอย่างน้อย 1 รายการ / Pick at least one item.'); return; }
+
+  const items = [];
+  cart.forEach((qty, cuid) => items.push({ cuid, qty }));
+
+  const submitBtn = document.getElementById('shop-submit');
+  submitting = true;
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'กำลังส่ง… / Sending…'; }
+
+  let res, data;
+  try {
+    res = await fetch(API_BASE + '/api/shop-public', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ u: userCuid, name, contact, items }),
+    });
+    data = await res.json();
+  } catch (err) {
+    toast('เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ — ลองใหม่อีกครั้ง / Could not reach the server — check your connection and try again.');
+    submitting = false;
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'ยืนยันการสั่งซื้อ / Confirm order'; }
+    return;
+  }
+  submitting = false;
+
+  if (!res.ok) {
+    if (res.status === 429) {
+      toast('ส่งคำสั่งซื้อบ่อยเกินไป — กรุณารอสักครู่แล้วลองใหม่ / Too many attempts — please wait a moment and try again.');
+    } else {
+      toast((data && data.error) || 'ส่งคำสั่งซื้อไม่สำเร็จ — ลองใหม่อีกครั้ง / That did not work — please try again.');
+    }
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'ยืนยันการสั่งซื้อ / Confirm order'; }
+    return;
+  }
+
+  const bar = document.getElementById('shop-bar');
+  if (bar) bar.remove();
+  document.getElementById('shop-order-form-wrap').innerHTML = '';
+  document.getElementById('shop-body').innerHTML = `
+    <div class="shop-confirm">
+      <div class="icon">✅</div>
+      <h2>ส่งคำสั่งซื้อแล้ว ✓</h2>
+      <p>${esc(ownerName || 'เจ้าของร้าน')} จะติดต่อกลับ<br>Order sent — ${esc(ownerName || 'they')}'ll be in touch.</p>
+    </div>`;
+}
+
+loadShop();
+</script>

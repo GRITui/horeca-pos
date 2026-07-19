@@ -1,0 +1,68 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main, personal-gym-trainer-freelanz]
+  workflow_dispatch:
+
+# Least-privilege perms for the Pages deployment
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let a newer push supersede an in-flight run
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # This single Pages site hosts two builds of the app, built from two
+      # branches on every run regardless of which one triggered it, so a push
+      # to either branch can never wipe out the other's live pages:
+      #   /       <- main (Sidekick, the flagship app — formerly the general
+      #              multi-persona "Freelanz" app, retired and replaced when
+      #              personal-gym-trainer-freelanz was promoted to main)
+      #   /gym/   <- personal-gym-trainer-freelanz (kept as its own branch;
+      #              identical to main at the time of promotion, free to
+      #              diverge again if it's used for further gym-specific work)
+      - name: Checkout main (root app)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: site-main
+
+      - name: Checkout gym fork (subpath app)
+        uses: actions/checkout@v4
+        with:
+          ref: personal-gym-trainer-freelanz
+          path: site-gym
+
+      - name: Assemble combined Pages site
+        run: |
+          mkdir -p _site
+          cp -r site-main/app/. _site/
+          mkdir -p _site/gym
+          cp -r site-gym/app/. _site/gym/
+          # /demo <- main's repo-root demo/ (a redirect page into the root
+          # app's demo mode — see demo/index.html; not a third app build)
+          mkdir -p _site/demo
+          cp -r site-main/demo/. _site/demo/
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload combined site as the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

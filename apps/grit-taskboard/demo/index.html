@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!-- Sidekick — /demo entry point.
+
+     The sales-pitch demo used to be a "Try a demo" button on the login page;
+     it now lives at this dedicated URL instead (button removed 2026-07-17)
+     so prospects can be sent one link and real users see a clean login.
+
+     This page is deliberately a dumb redirect, not a copy of the app: the
+     combined GitHub Pages build (.github/workflows/deploy-pages.yml) copies
+     this folder to <site>/demo/, and ../login.html resolves to the real app
+     one level up. login.html reads ?demo=1 and calls startDemo() (app.js),
+     which keeps its existing wipe-confirm guard for devices that already
+     hold guest data. -->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sidekick — Demo</title>
+<meta name="robots" content="noindex">
+<script>location.replace('../login.html?demo=1');</script>
+<meta http-equiv="refresh" content="0;url=../login.html?demo=1">
+<p style="font-family:sans-serif;padding:24px">Loading the Sidekick demo… <a href="../login.html?demo=1">Continue</a></p>

@@ -1,0 +1,106 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>Sidekick — Log in</title>
+<meta name="description" content="Local-first admin for freelancers: bookings, invoicing, tax, docs, and client follow-up — all on your device.">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#F7F6F2">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Sidekick">
+<link rel="icon" href="icons/icon.svg">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<script>(function(){var K='sidekick_ui_theme',t=localStorage.getItem(K);if(t==='dark')document.documentElement.dataset.theme='dark';else if(t!=='auto')document.documentElement.dataset.theme='light';})();</script><!-- light by default: set before CSS paints to avoid a flash of the wrong theme -->
+<link rel="stylesheet" href="styles.css?v=0.9.37">
+<!-- data-page drives boot(): 'login' → bootLogin() (redirects to ./ when already signed in) -->
+<body data-page="login">
+
+<div class="auth active" id="s-auth">
+  <div class="auth-hero">
+    <img class="auth-logo" src="icons/icon.svg" alt="">
+    <h1>Sidekick</h1>
+    <p data-i18n="tagline">Get booked. Get hired. Get paid.</p>
+  </div>
+  <div class="auth-card">
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tab-login" onclick="setAuthMode('login')" data-i18n="login">Log in</button>
+      <button class="auth-tab" id="tab-register" onclick="setAuthMode('register')" data-i18n="create_account">Create account</button>
+    </div>
+    <div class="auth-err" id="auth-err" role="alert" aria-atomic="true"></div>
+    <div class="auth-field">
+      <label for="auth-user" data-i18n="email">Email or username</label>
+      <input type="text" id="auth-user" autocomplete="username" placeholder="you@example.com" autocapitalize="none" inputmode="email">
+    </div>
+    <div class="auth-field" id="auth-name-wrap" style="display:none">
+      <label for="auth-name" data-i18n="your_name">Your name</label>
+      <input id="auth-name" autocomplete="given-name" placeholder="Alex">
+    </div>
+    <div class="auth-field">
+      <label for="auth-pass" data-i18n="password">Password</label>
+      <input type="password" id="auth-pass" autocomplete="current-password" placeholder="••••••••">
+    </div>
+    <div class="auth-field" id="auth-confirm-wrap" style="display:none">
+      <label for="auth-confirm" data-i18n="confirm_password">Confirm password</label>
+      <input type="password" id="auth-confirm" autocomplete="new-password" placeholder="••••••••">
+    </div>
+    <button class="auth-btn" id="auth-submit" onclick="submitAuth()" data-i18n="login">Log in</button>
+    <button class="auth-btn line" onclick="loginWithLine()" data-i18n="login_line">Continue with LINE</button>
+    <button class="auth-btn guest" onclick="loginGuest()" data-i18n="login_guest">Continue as guest</button>
+    <div class="auth-hint"><span id="auth-hint-text"></span><br><br>Local-first · No cloud · Built with Claude</div>
+  </div>
+</div>
+
+<div class="auth" id="s-line-profile">
+  <div class="auth-hero">
+    <img class="auth-logo" src="icons/icon.svg" alt="">
+    <h1 data-i18n="line_profile_title">One more thing</h1>
+    <p data-i18n="line_profile_sub">What name should we use for you?</p>
+  </div>
+  <div class="auth-card">
+    <div class="auth-err" id="line-profile-err" role="alert" aria-atomic="true" data-i18n="err_auth_name_required">Please enter your name.</div>
+    <div class="auth-field">
+      <label for="line-profile-name" data-i18n="your_name">Your name</label>
+      <input id="line-profile-name" autocomplete="given-name" placeholder="Alex">
+    </div>
+    <button class="auth-btn" onclick="completeLineProfile()" data-i18n="btn_continue">Continue</button>
+  </div>
+</div>
+
+
+<div class="auth" id="s-guest-choice">
+  <div class="auth-hero">
+    <img class="auth-logo" src="icons/icon.svg" alt="">
+    <h1 data-i18n="guest_choice_title">Welcome back</h1>
+    <p data-i18n="guest_choice_sub">This device already has guest data saved on it.</p>
+  </div>
+  <div class="auth-card">
+    <button class="auth-btn" onclick="resumeGuest()"><span data-i18n="guest_resume_btn">Resume as</span> <span id="guest-choice-name"></span></button>
+    <button class="auth-btn guest" onclick="startFreshGuest()" data-i18n="guest_fresh_btn">Start fresh (erase this guest's data)</button>
+    <button class="auth-btn guest" onclick="cancelGuestChoice()" data-i18n="cancel">Cancel</button>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<script src="app.js?v=0.9.37"></script>
+<script>
+// Demo entry point (/demo/index.html redirects here with ?demo=1): the "Try a
+// demo" button was removed from this page — prospects get the demo via the
+// dedicated /demo URL instead, and real users see a clean login. startDemo()
+// (app.js) keeps its existing guard: if this device already has guest data,
+// it asks before wiping. Can't fire on 'load': bootLogin()'s openDB() is
+// async and startDemo() → guestDataExists() needs the IndexedDB handle, so
+// poll the top-level `db` binding (same global lexical scope as app.js)
+// until boot has opened it. If a stored session redirects to the app first,
+// the interval simply dies with the page — that's the intended behavior for
+// an already-logged-in visitor.
+if (new URLSearchParams(location.search).get('demo') === '1') {
+  const demoPoll = setInterval(() => {
+    if (typeof db !== 'undefined' && db && typeof startDemo === 'function') {
+      clearInterval(demoPoll);
+      startDemo();
+    }
+  }, 100);
+  setTimeout(() => clearInterval(demoPoll), 15000);   // give up quietly, login stays usable
+}
+</script>

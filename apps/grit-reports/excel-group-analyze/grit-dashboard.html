@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grit BizSuite Dashboard</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+      background: #1e1e1e;
+      color: #eee;
+      margin: 0;
+      padding: 28px 24px;
+      display: flex;
+      justify-content: center;
+    }
+    main { width: 100%; max-width: 1100px; }
+    h1 { font-size: 20px; margin: 0 0 4px 0; }
+    p.subtitle { color: #999; margin-top: 0; margin-bottom: 20px; font-size: 13px; }
+    a { color: #6ea8fe; }
+    h2 { font-size: 14px; margin: 0 0 10px 0; color: #ddd; }
+    h2 small { color: #999; font-weight: normal; }
+
+    .box {
+      border: 1px solid #3a3a3a; border-radius: 10px;
+      padding: 14px 16px; background: #232323;
+      margin-bottom: 14px;
+    }
+
+    label { font-size: 13px; color: #bbb; }
+    select, input[type="date"], input[type="text"], input[type="password"] {
+      background: #2a2a2a; color: #eee; border: 1px solid #555;
+      border-radius: 6px; padding: 7px 10px; font-size: 13px;
+    }
+    input[type="text"], input[type="password"] { width: 320px; max-width: 100%; }
+    button {
+      background: #2d6cdf; color: white; border: none;
+      padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer;
+    }
+    button:disabled { background: #444; cursor: not-allowed; }
+    button.secondary { background: #3a7d44; }
+    button.small { padding: 6px 10px; font-size: 12px; background: #444; }
+    button.small:hover { background: #555; }
+
+    #controls { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+    .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+    .muted { color: #999; font-size: 12px; }
+
+    #upstreamChips { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 0 0; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px;
+      font-size: 12px; border: 1px solid #555; background: #2a2a2a; color: #ccc;
+    }
+    .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; }
+    .chip.ok .dot { background: #4caf50; }
+    .chip.ok { border-color: #3a7d44; color: #cdeed4; }
+    .chip.missing .dot, .chip.unconfigured .dot { background: #d98c2b; }
+    .chip.missing, .chip.unconfigured { border-color: #6b4d1f; color: #f0cfa0; }
+    .chip.error .dot { background: #f44336; }
+    .chip.error { border-color: #7a2f28; color: #f5b8b2; }
+
+    #kpiBar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px; margin: 0 0 14px 0;
+    }
+    #kpiBar:empty { display: none; }
+    .kpiTile {
+      min-width: 0;
+      border: 1px solid #3a3a3a; border-radius: 10px;
+      padding: 12px 16px; background: #232323;
+    }
+    .kpiValue { font-size: 20px; font-weight: 600; color: #2d6cdf; word-break: break-word; }
+    .kpiLabel { font-size: 12px; color: #999; margin-top: 4px; }
+
+    #chartCanvasWrap { position: relative; width: 100%; height: 340px; max-width: 100%; }
+    #chartArea canvas { max-width: 100%; }
+
+    @media (max-width: 768px) {
+      body { padding: 18px 14px; }
+      #controls { gap: 10px; }
+      .field { flex: 1 1 150px; }
+      input[type="text"], input[type="password"] { width: 100%; }
+      #kpiBar { grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap: 8px; }
+      .kpiTile { padding: 10px 12px; }
+      .kpiValue { font-size: 17px; }
+      .kpiLabel { font-size: 11px; }
+      #chartCanvasWrap { height: 260px; }
+    }
+
+    @media (max-width: 480px) {
+      #kpiBar { grid-template-columns: repeat(2, 1fr); }
+      #chartCanvasWrap { height: 220px; }
+    }
+
+    #status { margin: 14px 0; font-size: 14px; white-space: pre-wrap; }
+    .success { color: #4caf50; }
+    .error { color: #f44336; }
+    .warning { color: #d98c2b; }
+
+    #lockedPanel { display: none; text-align: center; padding: 32px 20px; }
+    #lockedPanel h2 { font-size: 16px; margin-bottom: 8px; }
+    #lockedPanel p { color: #bbb; font-size: 13.5px; max-width: 560px; margin: 6px auto; line-height: 1.55; }
+    #lockedPanel code {
+      background: #2a2a2a; border: 1px solid #444; border-radius: 4px;
+      padding: 1px 5px; font-size: 12px; color: #cfe0ff;
+    }
+
+    header.topLink { text-align: right; margin-bottom: 10px; }
+    header.topLink a { font-size: 12.5px; color: #999; text-decoration: none; }
+    header.topLink a:hover { color: #6ea8fe; text-decoration: underline; }
+
+    #resultArea { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="topLink"><a href="index.html">&larr; Excel Group &amp; Analyze</a></header>
+    <h1>Grit BizSuite Dashboard</h1>
+    <p class="subtitle">
+      Cross-app margin &amp; labor-efficiency aggregator &mdash; pulls POS revenue, inventory FIFO COGS,
+      and taskboard completion data over HTTP (never a direct database query) and requires the
+      <code>custom_reporting</code> addon.
+    </p>
+
+    <div class="box" id="controlsBox">
+      <h2>Session &amp; range</h2>
+      <div id="controls">
+        <div class="field">
+          <label for="jwtInput">Grit Passport JWT (optional if the <code>grit_passport</code> cookie is set)</label>
+          <input type="password" id="jwtInput" placeholder="Paste a bearer token, or leave blank to use the cookie" />
+        </div>
+        <div class="field">
+          <label for="fromInput">From</label>
+          <input type="date" id="fromInput" />
+        </div>
+        <div class="field">
+          <label for="toInput">To</label>
+          <input type="date" id="toInput" />
+        </div>
+        <div class="field">
+          <button id="loadBtn" type="button">Load dashboard</button>
+        </div>
+      </div>
+      <div id="upstreamChips"></div>
+    </div>
+
+    <div id="status"></div>
+
+    <div id="lockedPanel" class="box">
+      <h2>&#128274; Custom reporting addon required</h2>
+      <p id="lockedMessage">
+        This dashboard reads from grit-pos, grit-inventory and grit-taskboard through the
+        cross-app aggregator, which is gated behind the <code>custom_reporting</code> addon
+        (available from the GROWTH tier up). Ask your org owner to add it, or sign in with an
+        account whose Grit Passport session includes it.
+      </p>
+    </div>
+
+    <div id="resultArea">
+      <div id="kpiBar"></div>
+
+      <div class="box" id="chartArea">
+        <h2>Daily revenue <small>&mdash; per-day COGS/margin aren't available from the inventory COGS endpoint (period totals only), so the bars show revenue</small></h2>
+        <div id="chartCanvasWrap"><canvas id="dashCanvas"></canvas></div>
+      </div>
+
+      <div class="box" id="downloadBox">
+        <h2>Export</h2>
+        <p class="muted">
+          Downloads the aggregate rows (summary + daily revenue) as a CSV you can drop straight into
+          <a href="index.html">Excel Group &amp; Analyze</a> for further grouping/charting.
+        </p>
+        <button class="secondary" id="downloadCsvBtn" type="button">Download CSV</button>
+      </div>
+    </div>
+  </main>
+
+  <script src="chart.umd.js"></script>
+  <script src="grit-dashboard.js"></script>
+</body>
+</html>

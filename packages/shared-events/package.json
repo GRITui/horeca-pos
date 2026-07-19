@@ -1,0 +1,15 @@
+{
+  "name": "@grit/shared-events",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Grit BizSuite inter-app event layer: event contracts, HMAC-signed internal webhooks, and a durable outbox-backed event bus.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./contracts": "./src/contracts.ts",
+    "./webhook": "./src/webhook.ts",
+    "./bus": "./src/bus.ts"
+  }
+}

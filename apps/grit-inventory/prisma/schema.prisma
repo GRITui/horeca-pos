@@ -1,0 +1,881 @@
+// Prisma schema — Ecommerce Order-Fulfillment / Inventory / Delivery Platform
+// Milestone 1 (admin-only ops tool). See docs/ecommerce-stack-handoff.md for the full spec.
+//
+// Note on multi-tenancy: every domain table carries a `tenantId`, and a nullable
+// `storeId` is present from day one (see Store/User/Order/Delivery/StockMovement)
+// so Milestone 2's move to non-nullable, fully store-scoped stock does not
+// require a destructive migration.
+//
+// Bundle / BundleComponent below are stubbed now (unused by any M1 code path)
+// per the handoff so Milestone 2 (build-to-sell bundles) doesn't require a
+// destructive migration either.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  STAFF
+}
+
+enum OrderStatus {
+  pending
+  paid
+  fulfilling
+  fulfilled
+  cancelled
+}
+
+enum DeliveryStatus {
+  assigned
+  out_for_delivery
+  delivered
+  failed
+}
+
+enum PaymentMethod {
+  cash
+  card
+  bank_transfer
+  other
+}
+
+enum PaymentStatus {
+  pending
+  completed
+  failed
+  refunded
+}
+
+enum StockMovementReason {
+  manual_adjustment
+  order_fulfillment
+  restock
+  return
+  correction
+  // Grit BizSuite pivot additions (additive — see migration
+  // 20260718100000_grit_inventory_pivot):
+  transfer_out
+  transfer_in
+  pos_sale
+}
+
+/// Grit pivot: inter-store transfer order lifecycle. Mirrors the canonical
+/// platform values in @grit/database `stock_transfers.status`.
+enum StockTransferStatus {
+  draft
+  in_transit
+  received
+  cancelled
+}
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  /// Grit pivot: commercial tier ("LITE" | "GROWTH" | "SCALE") — mirrors
+  /// @grit/database organizations.tier. Kept as String (not enum) to match
+  /// the platform's varchar+CHECK convention for extensibility.
+  tier      String   @default("GROWTH")
+  /// Grit pivot: addon flags (e.g. "custom_reporting") — mirrors
+  /// @grit/database organization_addons.
+  addons    String[] @default([])
+  /// Grit pivot (discount resolution policy, BACKLOG.md): tenant-wide
+  /// per-line discount resolution policy ("NO_STACKING" | "STACK_ALL"),
+  /// applied by Grit POS's `evaluatePromotions` before summing a cart's
+  /// discount. Kept as String (not enum) to match the platform's
+  /// varchar+CHECK-as-string convention, same as `tier` above. Changes are
+  /// published as `discount_policy.updated` so POS's offline-first cache
+  /// stays in sync — see src/lib/events.ts.
+  discountStackingPolicy String @default("NO_STACKING")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stores         Store[]
+  users          User[]
+  products       Product[]
+  variants       Variant[]
+  orders         Order[]
+  bundles        Bundle[]
+  storeStocks    StoreStock[]
+  stockTransfers StockTransfer[]
+  stockLots      StockLot[]
+  itemGroups       ItemGroup[]
+  itemSubGroups    ItemSubGroup[]
+  variantLocations VariantLocation[]
+  pickTasks        PickTask[]
+  packTasks        PackTask[]
+  parcelLabels     ParcelLabel[]
+  promotions       Promotion[]
+  promotionExclusions PromotionExclusion[]
+}
+
+/// Grit pivot (M2 multi-location, executed): tenants may now hold multiple
+/// stores. Exactly one store per tenant should have `isDefault = true`; new
+/// stores must be created with `isDefault: false`.
+model Store {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  name      String
+  /// Mirrors @grit/database locations.type:
+  /// 'retail' | 'warehouse' | 'service_hub' | 'kitchen'. Kept as String
+  /// (varchar) to match the platform's varchar+CHECK convention.
+  type      String   @default("retail") @db.VarChar(32)
+  isDefault Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users          User[]
+  orders         Order[]
+  deliveries     Delivery[]
+  stockMovements StockMovement[]
+  storeStocks    StoreStock[]
+  stockLots      StockLot[]
+  transfersFrom  StockTransfer[] @relation("TransferFromStore")
+  transfersTo    StockTransfer[] @relation("TransferToStore")
+  variantLocations VariantLocation[]
+  pickTasks        PickTask[]
+
+  @@index([tenantId])
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  storeId      String?
+  store        Store?   @relation(fields: [storeId], references: [id])
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role     @default(STAFF)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  ordersCreated     Order[]           @relation("OrderCreatedBy")
+  /// Grit BizSuite pivot: picking module — staff assigned to a pick task.
+  pickTasksAssigned PickTask[]        @relation("PickTaskAssignedTo")
+  /// Grit BizSuite pivot: parcel labels printed by this staff member.
+  parcelLabelsPrinted ParcelLabel[]   @relation("ParcelLabelCreatedBy")
+
+  @@index([tenantId])
+}
+
+model Product {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  name         String
+  description  String?
+  /// Grit pivot: preferred supplier, published on
+  /// `inventory.threshold_breached` events so Taskboard restock cards are
+  /// actionable. (The platform schema models a suppliers table +
+  /// products.supplier_id; this app keeps a denormalized name — divergence
+  /// documented in README.)
+  supplierName String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  /// Grit BizSuite pivot: item group/sub-group categorization. Nullable —
+  /// existing products stay uncategorized until assigned.
+  subGroupId String?
+  subGroup   ItemSubGroup? @relation(fields: [subGroupId], references: [id])
+
+  variants Variant[]
+
+  @@index([tenantId])
+  @@index([subGroupId])
+}
+
+/// Grit pivot (M2 multi-location, executed): per-store quantities live on
+/// `StoreStock`; `quantityOnHand` here is a MAINTAINED AGGREGATE (sum of the
+/// tenant's StoreStock rows for this variant), updated in the same
+/// transaction as every store-level movement so existing single-store
+/// screens/queries keep working unchanged.
+model Variant {
+  id               String   @id @default(cuid())
+  tenantId         String
+  tenant           Tenant   @relation(fields: [tenantId], references: [id])
+  productId        String
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sku              String
+  name             String
+  price            Decimal  @db.Decimal(12, 2)
+  /// Grit pivot: default acquisition cost used when a restock does not
+  /// specify one, and the FIFO fallback cost when no lots remain.
+  unitCost         Decimal? @db.Decimal(12, 2)
+  quantityOnHand   Int      @default(0)
+  reorderThreshold Int      @default(0)
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  stockMovements    StockMovement[]
+  orderLines        OrderLine[]
+  bundleComponents  BundleComponent[]
+  forecastSnapshots ForecastSnapshot[]
+  deadStockFlags    DeadStockFlag[]
+  storeStocks       StoreStock[]
+  stockLots         StockLot[]
+  transferItems     StockTransferItem[]
+  /// Grit BizSuite pivot: planogram slot(s) — where this variant physically
+  /// lives per store. Zero or more; typically one marked isPrimary per store.
+  locations         VariantLocation[]
+  pickTaskItems     PickTaskItem[]
+  packTaskItems     PackTaskItem[]
+  promotionScopes   PromotionVariant[]
+
+  @@unique([tenantId, sku])
+  @@index([tenantId, productId])
+}
+
+// ---------------------------------------------------------------------------
+// Grit BizSuite pivot — multi-location stock, transfer orders, FIFO costing,
+// event ingestion. All additive; see
+// prisma/migrations/20260718100000_grit_inventory_pivot/migration.sql.
+// Field/table naming mirrors @grit/database (the canonical platform
+// contract): StoreStock ≈ inventory_stocks, StockLot ≈ stock_lots,
+// StockTransfer(-Item) ≈ stock_transfers(_items). Divergences are documented
+// in README.md.
+// ---------------------------------------------------------------------------
+
+/// Per-store stock level for a variant — the authoritative quantity record
+/// since the multi-location pivot (Variant.quantityOnHand is the maintained
+/// tenant-wide aggregate). Mirrors @grit/database inventory_stocks.
+model StoreStock {
+  id               String   @id @default(cuid())
+  tenantId         String
+  tenant           Tenant   @relation(fields: [tenantId], references: [id])
+  storeId          String
+  store            Store    @relation(fields: [storeId], references: [id])
+  variantId        String
+  variant          Variant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  quantityOnHand   Int      @default(0)
+  reorderThreshold Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([tenantId, storeId, variantId])
+  @@index([tenantId, variantId])
+  @@index([storeId])
+}
+
+/// FIFO cost layer: each restock receipt creates a lot; consumption drains
+/// `quantityRemaining` oldest-first by `receivedAt`. Mirrors @grit/database
+/// stock_lots (scoped per store + variant here).
+model StockLot {
+  id                String   @id @default(cuid())
+  tenantId          String
+  tenant            Tenant   @relation(fields: [tenantId], references: [id])
+  storeId           String
+  store             Store    @relation(fields: [storeId], references: [id])
+  variantId         String
+  variant           Variant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  receivedAt        DateTime @default(now())
+  quantityReceived  Int
+  quantityRemaining Int
+  unitCost          Decimal  @db.Decimal(12, 2)
+
+  consumptions StockLotConsumption[]
+
+  @@index([tenantId, storeId, variantId, receivedAt])
+}
+
+/// Audit of which lots a consuming StockMovement drained (and at what unit
+/// cost) — the source records for the FIFO COGS report. `lotId` is null for
+/// fallback consumption (no open lots; costed at Variant.unitCost).
+model StockLotConsumption {
+  id         String        @id @default(cuid())
+  tenantId   String
+  movementId String
+  movement   StockMovement @relation(fields: [movementId], references: [id], onDelete: Cascade)
+  lotId      String?
+  lot        StockLot?     @relation(fields: [lotId], references: [id])
+  variantId  String
+  storeId    String
+  quantity   Int
+  unitCost   Decimal       @db.Decimal(12, 2)
+  createdAt  DateTime      @default(now())
+
+  @@index([tenantId, variantId, createdAt])
+  @@index([movementId])
+  @@index([lotId])
+}
+
+/// Inter-store transfer order. Status flow:
+/// draft -> in_transit (source decremented, reason `transfer_out`)
+///       -> received   (destination incremented, reason `transfer_in`)
+/// draft|in_transit -> cancelled (in_transit cancellation restores source).
+model StockTransfer {
+  id           String              @id @default(cuid())
+  tenantId     String
+  tenant       Tenant              @relation(fields: [tenantId], references: [id])
+  fromStoreId  String
+  fromStore    Store               @relation("TransferFromStore", fields: [fromStoreId], references: [id])
+  toStoreId    String
+  toStore      Store               @relation("TransferToStore", fields: [toStoreId], references: [id])
+  status       StockTransferStatus @default(draft)
+  note         String?
+  createdById  String?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  dispatchedAt DateTime?
+  receivedAt   DateTime?
+  cancelledAt  DateTime?
+
+  items StockTransferItem[]
+
+  @@index([tenantId, status])
+}
+
+model StockTransferItem {
+  id         String        @id @default(cuid())
+  transferId String
+  transfer   StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  variantId  String
+  variant    Variant       @relation(fields: [variantId], references: [id])
+  quantity   Int
+  /// FIFO cost per unit captured when the source store was drained
+  /// (transfer_out); carried to the destination's receipt lot.
+  unitCost   Decimal?      @db.Decimal(12, 2)
+
+  @@index([transferId])
+}
+
+/// Inbound webhook idempotency: one row per processed @grit/shared-events
+/// `event_id`. Insert-or-conflict is the dedupe gate.
+model ProcessedEvent {
+  id         String   @id @default(cuid())
+  eventId    String   @unique
+  eventName  String
+  receivedAt DateTime @default(now())
+}
+
+/// Durable event outbox for @grit/shared-events publishes, drained by
+/// /api/cron/events-drain. Mirrors @grit/database event_outbox (divergence:
+/// organization_id is TEXT here because this app's tenant ids are cuids,
+/// not uuids — see README).
+model EventOutbox {
+  eventId        String    @id @map("event_id") @db.VarChar(100)
+  eventName      String    @map("event_name") @db.VarChar(100)
+  organizationId String?   @map("organization_id")
+  payload        Json
+  createdAt      DateTime? @default(now()) @map("created_at")
+  deliveredAt    DateTime? @map("delivered_at")
+
+  @@map("event_outbox")
+}
+
+/// Append-only audit trail. Every stock change (manual edit, order
+/// fulfillment, restock, bundle component decrement) writes one row here.
+model StockMovement {
+  id          String              @id @default(cuid())
+  tenantId    String
+  storeId     String?
+  store       Store?              @relation(fields: [storeId], references: [id])
+  variantId   String
+  variant     Variant             @relation(fields: [variantId], references: [id])
+  delta       Int
+  reason      StockMovementReason
+  orderLineId String?
+  orderLine   OrderLine?          @relation(fields: [orderLineId], references: [id])
+  bundleId    String?
+  bundle      Bundle?             @relation(fields: [bundleId], references: [id])
+  note        String?
+  createdById String?
+  createdAt   DateTime            @default(now())
+
+  lotConsumptions StockLotConsumption[]
+
+  @@index([tenantId, variantId])
+  @@index([storeId])
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  tenantId        String
+  tenant          Tenant      @relation(fields: [tenantId], references: [id])
+  storeId         String?
+  store           Store?      @relation(fields: [storeId], references: [id])
+  orderNumber     String
+  status          OrderStatus @default(pending)
+  customerName    String?
+  customerPhone   String?
+  customerAddress String?
+  notes           String?
+  createdById     String?
+  createdBy       User?       @relation("OrderCreatedBy", fields: [createdById], references: [id])
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  lines    OrderLine[]
+  payments Payment[]
+  delivery Delivery?
+
+  /// Grit BizSuite pivot: picking/packing/label workflow, layered onto the
+  /// existing pending→paid→fulfilling→fulfilled state machine (lib/orders.ts
+  /// is unchanged — these are optional operational sub-steps engaged only
+  /// when a PickTask is explicitly created for the order; see lib/picking.ts
+  /// and lib/packing.ts).
+  pickTask     PickTask?
+  packTask     PackTask?
+  parcelLabels ParcelLabel[]
+
+  @@unique([tenantId, orderNumber])
+  @@index([tenantId, status])
+  @@index([storeId])
+}
+
+model OrderLine {
+  id          String   @id @default(cuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variantId   String?
+  variant     Variant? @relation(fields: [variantId], references: [id])
+  bundleId    String?
+  bundle      Bundle?  @relation(fields: [bundleId], references: [id])
+  description String
+  unitPrice   Decimal  @db.Decimal(12, 2)
+  quantity    Int
+  createdAt   DateTime @default(now())
+
+  stockMovements StockMovement[]
+
+  @@index([orderId])
+}
+
+model Payment {
+  id        String        @id @default(cuid())
+  orderId   String
+  order     Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  method    PaymentMethod
+  status    PaymentStatus @default(pending)
+  amount    Decimal       @db.Decimal(12, 2)
+  reference String?
+  createdAt DateTime      @default(now())
+
+  @@index([orderId])
+}
+
+/// Manual staff-updated statuses for M1. courierName/externalTrackingId are
+/// present unused so a future courier webhook integration doesn't need a
+/// schema break — see handoff Section 6.
+model Delivery {
+  id                 String         @id @default(cuid())
+  tenantId           String
+  storeId            String?
+  store              Store?         @relation(fields: [storeId], references: [id])
+  orderId            String         @unique
+  order              Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status             DeliveryStatus @default(assigned)
+  assignedTo         String?
+  address            String?
+  courierName        String?
+  externalTrackingId String?
+  notes              String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  statusHistory DeliveryStatusEvent[]
+
+  @@index([tenantId, status])
+}
+
+model DeliveryStatusEvent {
+  id         String         @id @default(cuid())
+  deliveryId String
+  delivery   Delivery       @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  status     DeliveryStatus
+  note       String?
+  createdAt  DateTime       @default(now())
+
+  @@index([deliveryId])
+}
+
+model ForecastSnapshot {
+  id                  String   @id @default(cuid())
+  tenantId            String
+  variantId           String
+  variant             Variant  @relation(fields: [variantId], references: [id])
+  periodStart         DateTime
+  periodEnd           DateTime
+  method              String
+  forecastQty         Decimal  @db.Decimal(12, 2)
+  suggestedReorderQty Int      @default(0)
+  createdAt           DateTime @default(now())
+
+  @@index([tenantId, variantId, periodStart])
+}
+
+model DeadStockFlag {
+  id                String    @id @default(cuid())
+  tenantId          String
+  variantId         String
+  variant           Variant   @relation(fields: [variantId], references: [id])
+  reason            String
+  daysSinceLastSale Int
+  quantityOnHand    Int
+  flaggedAt         DateTime  @default(now())
+  resolvedAt        DateTime?
+
+  @@index([tenantId, variantId])
+}
+
+// --- Stubbed for M2 (build-to-sell bundles) — see handoff Section 4.2. ---
+// Unused by any M1 code path. A Bundle never holds its own stock; sellable
+// quantity is always derived from its components at read time.
+
+model Bundle {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  sku       String
+  name      String
+  price     Decimal  @db.Decimal(12, 2)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  components     BundleComponent[] @relation("BundleComponents")
+  usedInBundles  BundleComponent[] @relation("BundleOfBundles")
+  orderLines     OrderLine[]
+  stockMovements StockMovement[]
+
+  @@unique([tenantId, sku])
+  @@index([tenantId])
+}
+
+/// componentVariantId XOR componentBundleId (enforced at app level) so a
+/// component can be a leaf Variant or another Bundle (bundle-of-bundles),
+/// resolved recursively to leaf variants at availability/decrement time.
+model BundleComponent {
+  id                 String   @id @default(cuid())
+  bundleId           String
+  bundle             Bundle   @relation("BundleComponents", fields: [bundleId], references: [id], onDelete: Cascade)
+  componentVariantId String?
+  componentVariant   Variant? @relation(fields: [componentVariantId], references: [id])
+  componentBundleId  String?
+  componentBundle    Bundle?  @relation("BundleOfBundles", fields: [componentBundleId], references: [id])
+  qtyRequired        Int
+
+  @@index([bundleId])
+}
+
+// ---------------------------------------------------------------------------
+// Grit BizSuite pivot: warehouse operations — item groups/sub-groups, item
+// location/planogram management, picking + packing (layered on the existing
+// Order state machine, additive only — see lib/orders.ts's unchanged
+// pending→paid→fulfilling→fulfilled machine), and parcel label printing.
+// ---------------------------------------------------------------------------
+
+enum PickTaskStatus {
+  pending
+  in_progress
+  complete
+}
+
+enum PackTaskStatus {
+  pending
+  in_progress
+  complete
+}
+
+/// Top-level product categorization (e.g. "Apparel", "Industrial Supplies").
+model ItemGroup {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  name      String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subGroups ItemSubGroup[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+/// Second-level categorization within a group (e.g. "T-Shirts" under
+/// "Apparel"). Products reference a sub-group directly; the parent group is
+/// reached via subGroup.group.
+model ItemSubGroup {
+  id        String    @id @default(cuid())
+  tenantId  String
+  tenant    Tenant    @relation(fields: [tenantId], references: [id])
+  groupId   String
+  group     ItemGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  name      String
+  sortOrder Int       @default(0)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  products         Product[]
+  promotionScopes  PromotionGroup[]
+
+  @@unique([groupId, name])
+  @@index([tenantId])
+}
+
+/// Planogram slot: where a variant physically lives within a store (aisle /
+/// shelf / bin). A variant may have more than one row per store (forward-pick
+/// + bulk-reserve); `isPrimary` marks the one picking should default to.
+/// Application code (variant-locations routes) flips any existing primary
+/// row for the same (storeId, variantId) to false before setting a new one,
+/// and that exclusivity is additionally enforced at the DB level by a
+/// partial unique index — `VariantLocation_variantId_storeId_primary_key` in
+/// migration 20260719003027_variant_location_primary_unique — since Prisma's
+/// declarative schema DSL can't express a partial (WHERE isPrimary = true)
+/// unique index directly.
+model VariantLocation {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  storeId   String
+  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  variantId String
+  variant   Variant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  /// Human-entered slot code, e.g. "A1-03-02" (aisle-shelf-bin). Free-form —
+  /// stores may use whatever convention fits their layout.
+  code      String
+  zone      String?
+  isPrimary Boolean  @default(true)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, storeId])
+  @@index([variantId])
+}
+
+/// One pick task per order (1:1) — the scanner-driven "go gather these items"
+/// step. Created explicitly by staff (not automatic) once an order enters
+/// `fulfilling`; its existence is what makes picking/packing apply to that
+/// order at all (an order that never gets a PickTask uses the plain
+/// fulfilling→fulfilled flow exactly as before this pivot).
+model PickTask {
+  id           String         @id @default(cuid())
+  tenantId     String
+  tenant       Tenant         @relation(fields: [tenantId], references: [id])
+  orderId      String         @unique
+  order        Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  storeId      String?
+  store        Store?         @relation(fields: [storeId], references: [id])
+  status       PickTaskStatus @default(pending)
+  assignedToId String?
+  assignedTo   User?          @relation("PickTaskAssignedTo", fields: [assignedToId], references: [id])
+  startedAt    DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  items PickTaskItem[]
+
+  @@index([tenantId, status])
+}
+
+model PickTaskItem {
+  id                String    @id @default(cuid())
+  pickTaskId        String
+  pickTask          PickTask  @relation(fields: [pickTaskId], references: [id], onDelete: Cascade)
+  orderLineId       String
+  variantId         String
+  variant           Variant   @relation(fields: [variantId], references: [id])
+  /// Snapshot of the variant's primary VariantLocation.code at task-creation
+  /// time — stays stable for the picker even if the location is edited later.
+  locationCode      String?
+  quantityRequired  Int
+  quantityPicked    Int       @default(0)
+  scannedAt         DateTime?
+
+  @@index([pickTaskId])
+  @@index([orderLineId])
+}
+
+/// One pack task per order (1:1), created once its PickTask completes — a
+/// second scan pass that re-verifies contents before sealing/labeling.
+model PackTask {
+  id          String         @id @default(cuid())
+  tenantId    String
+  tenant      Tenant         @relation(fields: [tenantId], references: [id])
+  orderId     String         @unique
+  order       Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status      PackTaskStatus @default(pending)
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  items PackTaskItem[]
+
+  @@index([tenantId, status])
+}
+
+model PackTaskItem {
+  id               String    @id @default(cuid())
+  packTaskId       String
+  packTask         PackTask  @relation(fields: [packTaskId], references: [id], onDelete: Cascade)
+  orderLineId      String
+  variantId        String
+  variant          Variant   @relation(fields: [variantId], references: [id])
+  quantityRequired Int
+  quantityPacked   Int       @default(0)
+  scannedAt        DateTime?
+
+  @@index([packTaskId])
+  @@index([orderLineId])
+}
+
+/// Internal parcel/shipping label — no real carrier integration (no
+/// FedEx/UPS API in scope); trackingRef is a self-generated internal
+/// reference printed as a barcode on an HTML label sized for label printers.
+model ParcelLabel {
+  id           String    @id @default(cuid())
+  tenantId     String
+  tenant       Tenant    @relation(fields: [tenantId], references: [id])
+  orderId      String
+  order        Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  deliveryId   String?
+  trackingRef  String    @unique
+  toName       String?
+  toAddress    String?
+  itemCount    Int
+  weightKg     Decimal?  @db.Decimal(8, 3)
+  createdById  String?
+  createdBy    User?     @relation("ParcelLabelCreatedBy", fields: [createdById], references: [id])
+  createdAt    DateTime  @default(now())
+  printedAt    DateTime?
+
+  @@index([tenantId, orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Grit BizSuite pivot: pricing/promotion rules. Source of truth here in
+// grit-inventory (alongside product/group master data); pushed to grit-pos
+// via the `promotion.updated` event (@grit/shared-events) so checkout can
+// apply them without a live cross-app call at sale time (grit-pos is
+// offline-first — see apps/grit-pos/lib/events.ts / components/pos/
+// offlineQueue.ts). grit-pos caches the current rule set locally and
+// evaluates it against cart lines; this app never computes a POS discount
+// itself, it only defines and broadcasts the rules.
+// ---------------------------------------------------------------------------
+
+enum PromotionType {
+  /// "Buy X Pay Y" — e.g. buy 3, pay for 2 (buyQuantity=3, payQuantity=2).
+  buy_x_pay_y
+  /// "Buy X get a discount" — qty >= minQuantity unlocks discountKind/Value.
+  buy_x_get_discount
+  /// A fixed combined price for a specific set of different SKUs bought
+  /// together (each at its scopeVariants.requiredQuantity).
+  bundle_deal
+}
+
+enum PromotionDiscountKind {
+  percent
+  fixed_amount
+}
+
+model Promotion {
+  id       String         @id @default(cuid())
+  tenantId String
+  tenant   Tenant         @relation(fields: [tenantId], references: [id])
+  name     String
+  type     PromotionType
+  isActive Boolean        @default(true)
+  startsAt DateTime?
+  endsAt   DateTime?
+
+  /// buy_x_pay_y
+  buyQuantity Int?
+  payQuantity Int?
+
+  /// buy_x_get_discount
+  minQuantity   Int?
+  discountKind  PromotionDiscountKind?
+  /// Percent (0–100) or a fixed amount off, per discountKind.
+  discountValue Decimal? @db.Decimal(10, 2)
+
+  /// bundle_deal — the fixed total price for one instance of the bundle set.
+  bundlePrice Decimal? @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The variants this rule applies to (buy_x_pay_y / buy_x_get_discount
+  /// scope) or the bundle's member SKUs (bundle_deal, requiredQuantity per
+  /// member — default 1).
+  scopeVariants PromotionVariant[]
+  /// Alternative/additional scoping by item sub-group instead of, or in
+  /// addition to, specific variants (buy_x_pay_y / buy_x_get_discount only —
+  /// bundle_deal always scopes by explicit member variants).
+  scopeGroups   PromotionGroup[]
+
+  /// Discount resolution policy (BACKLOG.md), per-order exclusion layer:
+  /// other promotions this rule must never co-apply with on the same order.
+  /// Undirected pairs are normalized at write time (lexicographically
+  /// smaller promotion id stored as `promotionId`) so a pair is never
+  /// double-stored as both A-excludes-B and B-excludes-A — see
+  /// PromotionExclusion below and src/lib/promotions.ts.
+  exclusionsAsPrimary   PromotionExclusion[] @relation("PromotionExclusionPrimary")
+  exclusionsAsSecondary PromotionExclusion[] @relation("PromotionExclusionSecondary")
+
+  @@index([tenantId, isActive])
+}
+
+model PromotionVariant {
+  id               String    @id @default(cuid())
+  promotionId      String
+  promotion        Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  variantId        String
+  variant          Variant   @relation(fields: [variantId], references: [id])
+  requiredQuantity Int       @default(1)
+
+  @@index([promotionId])
+  @@index([variantId])
+}
+
+model PromotionGroup {
+  id          String       @id @default(cuid())
+  promotionId String
+  promotion   Promotion    @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  subGroupId  String
+  subGroup    ItemSubGroup @relation(fields: [subGroupId], references: [id])
+
+  @@index([promotionId])
+}
+
+/// Discount resolution policy (BACKLOG.md), layer 2: per-order exclusion
+/// rules — independent of Tenant.discountStackingPolicy, always enforced.
+/// An undirected pair (promotionId, excludedPromotionId); the app always
+/// writes the lexicographically-smaller promotion id as `promotionId` so
+/// A-excludes-B and B-excludes-A can never both be stored as separate rows
+/// (Prisma's schema DSL cannot express an order-independent uniqueness
+/// constraint directly, so this is enforced by normalizing at write time —
+/// see resolvePromotionExclusionPair in src/lib/promotions.ts — backed by
+/// the plain `@@unique` below on the now-canonical ordered pair).
+model PromotionExclusion {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  promotionId String
+  promotion   Promotion @relation("PromotionExclusionPrimary", fields: [promotionId], references: [id], onDelete: Cascade)
+
+  excludedPromotionId String
+  excludedPromotion   Promotion @relation("PromotionExclusionSecondary", fields: [excludedPromotionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([promotionId, excludedPromotionId])
+  @@index([tenantId])
+  @@index([excludedPromotionId])
+}
